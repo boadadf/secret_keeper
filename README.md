@@ -1,228 +1,208 @@
 # Secret Keeper
 
-Stop configured sensitive information from being sent to an external AI service.
+Keep control of the information your AI tools send to external servers.
 
-Secret Keeper runs between your AI tool and its server. It checks outgoing content against rules you control. If a blocking rule matches, it stops the request or message.
+Secret Keeper is a local proxy. It checks outgoing content against rules you choose and stops requests/messages that match a blocking rule. You can also save attempted outgoing content locally in a readable format for review.
 
-You can block customer names, internal addresses, passwords, keys, and other information that must not leave your environment.
+**Important:** It checks only traffic routed through it. It is an experimental protection layer, not a guarantee against every leak.
 
-**Important:** Only traffic passing through Secret Keeper is checked. It does not automatically protect every application or detect every possible secret.
+## What it does
 
-## How it works
+- Blocks registered company/customer names, internal URLs, email addresses, network addresses, identifiers, and resource names.
+- Detects selected password assignments, JSON credential fields, private-key blocks, token shapes, and credential-bearing connection strings.
+- Optionally checks supported encoded text, checksum candidates, phone shapes, hashes, and random-looking strings.
+- Inspects HTTP request bodies and outgoing WebSocket messages.
+- Keeps a metadata-only audit log by default.
+- Optionally creates BOTH a machine-readable capture and a readable text companion.
 
-```text
-Your AI tool
-    |
-    v
-Secret Keeper checks the outgoing content
-    |
-    +-- Blocking rule matches --> Stop the request
-    |
-    +-- No blocking rule ------> Send it to the AI service
-```
+Rules run locally without an LLM or online credential validation. An optional local semantic validator is planned, not implemented.
 
-The current rules run locally without an LLM. Secret Keeper does not send suspected credentials to a provider to check whether they work.
+## Windows quick start: from clone to first test
 
-It inspects HTTP request bodies and outgoing WebSocket messages. These are two ways AI clients send information to their servers.
+These instructions use Windows CMD. Have Git, Python 3.12 with the `py` launcher, and GitHub Copilot CLI installed. Copilot needs its own account/access and login setup.
 
-## Current version
-
-Patch 07 adds optional payload capture to the rule blocker from Patch 06.
-
-- The maintainer reports working live rule tests and working payload capture.
-- The earlier local HTTP/WebSocket test suite passed 12 checks.
-- Patch 06's 70 synthetic unit tests passed during package generation.
-- Patch 07's 17 capture-helper tests passed during package generation.
-- Run the combined tests and updated network suites on your installed version before declaring that release verified.
-
-Copilot's error presentation and retry delay remain unfinished. A test result applies to the tested scenarios, not every application, protocol, or secret.
-
-## What you can block
-
-| Information | Rule or detector |
-|---|---|
-| Company/customer names and aliases | Dictionary |
-| Fixed confidential markers | Exact text |
-| Internal URLs | Configured domains/subdomains |
-| Email addresses | Registered addresses or domains |
-| IPv4/IPv6 addresses | Configured network ranges |
-| Usernames and employee IDs | Registered structured fields and values |
-| Paths, bucket names, repository names | Registered resource strings |
-| Password/key/token assignments | Credential-assignment detector |
-| JSON credential fields | Credential-field detector |
-| Private-key blocks | Supported paired key markers |
-| Some provider token shapes | Supported-token detector |
-| Credential-bearing connection strings | Connection-string detector |
-| Encoded text | Bounded percent, hex, and Base64 decoding |
-| Card and IBAN candidates | Format/checksum detectors |
-| Phone, hash, random-looking strings | Optional candidate detectors |
-
-A pattern match does not prove a real secret exists. A public checksum, example credential, or protocol field can match. Phone detection is shape-only, not country-aware verification. Provider-token coverage is limited.
-
-The example policy puts card, IBAN, phone, hash, and entropy candidates in audit mode rather than blocking them.
-
-## Rule actions
-
-| Configuration | Behavior |
-|---|---|
-| Enabled + `block` | Stop matching content |
-| Enabled + `audit` | Record the match and allow it unless another rule blocks |
-| Disabled | Do not evaluate that rule |
-
-Any block wins, regardless of rule order. Audit mode does not prevent disclosure.
-
-## Windows setup
-
-Use Windows Command Prompt (CMD) for the documented workflow.
-
-From the repository root, install the declared development dependencies:
+### 1. Clone
 
 ```bat
-py -3.12 -m venv .venv
+git clone https://github.com/boadadf/secret_keeper.git
+cd secret_keeper
+```
+
+This README describes the files after merging Patch 08 with the earlier releases. If a script is missing from your checkout, that patch has not been published/merged there yet.
+
+### 2. Prepare the standalone proxy
+
+```bat
+scripts\setup-proxy.cmd
+```
+
+The setup script creates `.venv` if absent, installs `mitmproxy` and `pytest` from `requirements-proxy.txt`, and initializes a private policy from the public fictional example only if the private policy does not already exist.
+
+This is the standalone addon workflow. It does not install or verify the separate project CLI/package. For development of the full package, review `pyproject.toml` and use the declared development dependencies, for example:
+
+```bat
 .venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-This assumes the repository's `pyproject.toml` defines the `dev` extra. The supplied development setup script also uses Python 3.12.
+Runtime dependencies in the new minimal requirements file are not pinned. A tested/pinned release dependency set remains work to complete.
 
-Your client must be configured to use the proxy. For HTTPS interception, it must trust the proxy certificate. Starting the proxy does not configure the client automatically. Keep your existing working certificate setup; do not disable upstream TLS verification as a workaround.
-
-### Create a private policy
-
-Keep real company rules outside the checkout. The CMD launcher defaults to:
-
-```text
-%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json
-```
-
-For a new policy only:
+### 3. Review your policy
 
 ```bat
-if not exist "%LOCALAPPDATA%\SecretKeeper" mkdir "%LOCALAPPDATA%\SecretKeeper"
-if not exist "%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json" copy config\secret-keeper-policy.example.json "%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json"
 notepad "%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json"
 ```
 
-Review the fictional example before using it. Replace its sample values only in your private policy. Back up existing policies before changing them.
+It starts with fictional example values. Replace/merge values for your needs locally, not in the public example. The canary is disabled by default; some uncertain candidate detectors are audit-only.
 
-### Start the proxy
+An empty `rules` list allows inspectable content. Do not mistake it for protection.
 
-```bat
-scripts\capture-requests.cmd
-```
-
-The historical launcher name is unchanged. It starts the content-policy proxy, not full payload capture by default.
-
-The launcher uses:
-
-- `127.0.0.1:8080` as the listening address.
-- `%LOCALAPPDATA%\SecretKeeper` for certificate state.
-- A private policy outside the repository.
-- A metadata-only audit file under `%LOCALAPPDATA%\SecretKeeper\logs`.
-
-Keep it running in one CMD window and use another for your AI client. Stop it with `Ctrl+C`.
-
-For a different private policy:
-
-```bat
-set "SECRET_KEEPER_POLICY=C:\CompanyPolicy\secret-keeper-policy.json"
-scripts\capture-requests.cmd
-```
-
-The file must exist. Restart the proxy after policy edits.
-
-## Optional full payload capture — Patch 07
-
-Capture is off by default. Enable it only when you deliberately want to save outgoing content for later local analysis.
-
-It can save confidential information, including blocked attempts and old conversation context. Store captures outside Git, restrict access, and remove them after analysis.
-
-### Enable capture
-
-Stop the proxy. Add these options to the existing `mitmdump` command in your CMD launcher:
-
-```bat
---set capture_mode=full --set "capture_file=%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl"
-```
-
-For a multiline launcher, its final section can be:
-
-```bat
-  --set "request_log=%LOG%" ^
-  --set "secret_keeper_policy=%SECRET_KEEPER_POLICY%" ^
-  --set capture_mode=full ^
-  --set "capture_file=%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl"
-```
-
-These are proxy command options, NOT fields in the rule-policy JSON. Audit and capture must use different files.
-
-Restart:
+### 4. Start the proxy — first CMD window
 
 ```bat
 scripts\capture-requests.cmd
 ```
 
-Look for:
+Leave it running. It listens on `127.0.0.1:8080` and creates certificate state under `%LOCALAPPDATA%\SecretKeeper` if needed. Its historical filename is retained; capture is OFF unless you enable it.
+
+Stop older proxy processes first. Stop this one with `Ctrl+C`.
+
+### 5. Start Copilot through the proxy — second CMD window
+
+From the same checkout:
+
+```bat
+scripts\start-copilot.cmd
+```
+
+This wrapper sets `HTTP_PROXY`, `HTTPS_PROXY`, and `NODE_EXTRA_CA_CERTS` for the launched client process. The certificate file is `%LOCALAPPDATA%\SecretKeeper\mitmproxy-ca-cert.pem`, created when the proxy starts.
+
+The wrapper overrides these proxy/certificate variables inside its own process only. If you require existing extra certificate bundles or corporate proxy settings, have an administrator review/merge them instead of blindly using this wrapper.
+
+Trust only the CA from your own intended proxy. Do not set `NODE_TLS_REJECT_UNAUTHORIZED=0` or disable upstream certificate checks. Do not share the proxy CA private key. The wrapper does not change system-wide certificate trust.
+
+Different client versions/builds can handle proxies differently. The synthetic block test below is required to confirm your client is actually routed and inspected; merely starting both programs is not proof.
+
+### 6. Check normal behavior
+
+In a fresh conversation:
 
 ```text
-Secret Keeper FULL CAPTURE ACTIVE
+Reply with hello.
 ```
 
-`CAPTURE ERROR` means capture was disabled because the configuration was invalid or could not be used. `CAPTURE WRITE FAILED` means a record was not guaranteed saved. Neither intentionally disables rule enforcement.
+It should pass. Then test the enabled credential-assignment rule with synthetic content:
 
-### What is saved
+```text
+password = "Synthetic-Only-42"
+```
 
-- Attempted outgoing HTTP bodies and WebSocket payloads.
-- Allowed and blocked content.
-- Raw bytes stored as Base64.
-- Available decoded text.
-- Flow ID, time, transport, matched rule IDs, and final allow/block decision.
+It should produce a block record. A HTTP block returns local status 422. A WebSocket block drops the outgoing message. The client may display an error or retry; improving that UX remains unfinished.
 
-The record uses `capture_stage: attempted_outbound`. `ALLOW` means permitted to forward, not proof that the destination received it.
+Start a fresh conversation after a blocking test. Sensitive content may remain in carried history and legitimately block later harmless prompts.
 
-For HTTP, raw bytes may be compressed; available `body_text` is the text the addon inspected. Incoming messages, headers, full URLs, traffic bypassing the proxy, and files outside the payload are not captured.
+## Read the data being sent
 
-### Limits and rotation
+Default audit logs do NOT contain prompts. Enable full capture only when you deliberately want to save attempted outgoing content, including rejected content.
+
+Stop the proxy, then in its CMD window:
+
+```bat
+set "SECRET_KEEPER_CAPTURE_MODE=full"
+scripts\capture-requests.cmd
+```
+
+Expect `FULL CAPTURE ACTIVE`. The launcher writes:
+
+```text
+%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl
+%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl.txt
+```
+
+The first is the machine-readable record. The second is designed for people: separate records, clear decisions, expanded JSON fields/arrays, and wrapped text rather than one giant line.
+
+Open the readable file:
+
+```bat
+notepad "%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl.txt"
+```
+
+Example layout:
+
+```text
+OUTGOING PAYLOAD — HTTP — BLOCK
+Time: ...
+Flow: ...
+Stage: attempted outbound content; ALLOW does not prove destination receipt.
+Rules: credential-assignments
+
+CONTENT:
+  messages:
+    [0]
+      role:
+        user
+      content:
+        password = "Synthetic-Only-42"
+```
+
+Capture and inspection are independent. Turning capture on does not permit blocked content to forward. `ALLOW` means the proxy permitted forwarding, not proof that the server received the data.
+
+### View older JSONL captures
+
+```bat
+scripts\read-capture.cmd
+```
+
+Or select a file and filter:
+
+```bat
+scripts\read-capture.cmd "%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl" --decision BLOCK
+scripts\read-capture.cmd "%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl" --transport websocket
+```
+
+Create a NEW local text file from an existing JSONL file:
+
+```bat
+scripts\read-capture.cmd "%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl" --output "%LOCALAPPDATA%\SecretKeeper\captures\review.txt"
+```
+
+The viewer refuses to overwrite an existing output file. Conversion is local; no payload is uploaded. You can view rotated JSONL files in the same way.
+
+### Turn capture off
+
+Stop the proxy and run:
+
+```bat
+set "SECRET_KEEPER_CAPTURE_MODE=off"
+scripts\capture-requests.cmd
+```
+
+Disabling capture does not remove existing files.
+
+### Capture options and limits
+
+Options belong to the proxy command, NOT the rule-policy JSON:
 
 | Option | Default |
 |---|---|
-| `capture_mode` | `off` (`full` is the other supported value) |
-| `capture_file` | No default; required for full capture |
-| `capture_max_payload_bytes` | 1048576 — 1 MiB per raw/text representation |
-| `capture_max_file_bytes` | 16777216 — 16 MiB rotation size |
-| `capture_backups` | 3 rotated backups plus the current file |
+| `capture_mode` | `off`; use `full` explicitly |
+| `capture_file` | Required dedicated JSONL path for full mode |
+| `capture_readable` | `true` when full capture is enabled |
+| `capture_readable_file` | JSONL path plus `.txt` unless specified |
+| `capture_max_payload_bytes` | 1 MiB per raw/text representation |
+| `capture_max_file_bytes` | 16 MiB per output file |
+| `capture_backups` | 3 per output file |
 
-Larger representations are truncated. Records flag this using `raw_truncated` and `text_truncated`. Rotation removes the oldest backup. This is a rolling debugging capture, not a complete indefinite archive.
+JSONL and readable files rotate independently. Up to four files per format are retained by default; with two formats, the configured newly written storage budget can reach roughly 128 MiB. Old/pre-existing oversized files need separate review. Rotation deletes oldest backups, so this is not an indefinite archive.
 
-There is no redacted capture mode, encryption-at-rest feature, automatic age expiry, or secure-erasure feature. Windows folder permissions need administrator review. Use one writer per capture file. Capture adds disk work and can increase latency.
+Large captures are truncated and flagged. Readable formatting also has explicit display-depth/node/character limits. JSONL remains the primary record of captured bytes, itself subject to capture limits. Binary/non-UTF-8 data is summarized rather than dumped as huge Base64 text; its captured bytes remain in JSONL. No decompression, file extraction, or image inspection is added by the viewer.
 
-### View and disable capture
+`CAPTURE ERROR` means capture configuration failed and capture is disabled. `CAPTURE WRITE FAILED` means an output record was not guaranteed written. Check both outputs when diagnosing failures. Enforcement is not intentionally disabled by capture errors.
 
-```bat
-notepad "%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl"
-```
+Full capture may contain passwords, customer information, source code, and previous context. There is no encryption, redacted mode, automatic age expiry, secure erasure, or cloud upload. Restrict Windows folder access, keep files out of Git, and remove them after analysis. One writer per capture file; synchronous capture adds disk latency.
 
-To disable it, remove the capture options or set:
+## Rule configuration
 
-```bat
---set capture_mode=off
-```
-
-Restart the proxy. Disabling capture does not delete old files. Do not publish captures or upload them automatically to an external AI service.
-
-## Configure blocking rules
-
-Schema version 2 uses a `rules` list:
-
-```json
-{
-  "schema_version": 2,
-  "rules": []
-}
-```
-
-An empty list allows inspectable content. Use it only intentionally. Version-1 policies remain supported and are converted internally without rewriting the source file.
-
-### Customer-name dictionary
+Version-1 policies remain accepted. Version 2 supports per-rule controls:
 
 ```json
 {
@@ -242,7 +222,7 @@ An empty list allows inspectable content. Use it only intentionally. Version-1 p
       "entries": [
         {
           "id": "customer-001",
-          "values": ["Northstar Manufacturing", "Northstar Manufacturing GmbH"]
+          "values": ["Northstar Manufacturing"]
         }
       ]
     }
@@ -250,127 +230,43 @@ An empty list allows inspectable content. Use it only intentionally. Version-1 p
 }
 ```
 
-This matches different letter case and normalized whitespace. `Northstar` alone does not match the full registered phrase. Register aliases explicitly. `substring` instead of `whole_phrase` matches inside larger strings but can produce more unwanted matches.
+Rule IDs are logged; use opaque IDs, not confidential names. They must be unique lowercase letters/digits/hyphens/underscores, up to 64 characters. Invalid settings and duplicate IDs produce a policy error.
 
-### Internal URLs
-
-Add this rule to your list:
-
-```json
-{
-  "id": "internal-urls",
-  "type": "url_domain",
-  "enabled": true,
-  "action": "block",
-  "domains": ["example.internal"],
-  "include_subdomains": true
-}
-```
-
-It checks URLs inside content, not which servers an application may contact.
-
-### Usernames in structured fields
-
-```json
-{
-  "id": "registered-usernames",
-  "type": "field",
-  "enabled": true,
-  "action": "block",
-  "fields": ["username", "login", "employee_id"],
-  "values": ["synthetic-user-001"],
-  "case_sensitive": false
-}
-```
-
-This matches registered structured fields. Use a dictionary to match a username in ordinary prose. An empty `values` list means any nonempty, non-redacted scalar in those fields can match.
-
-### Built-in detectors
-
-```json
-{
-  "id": "credential-assignments",
-  "type": "builtin",
-  "enabled": true,
-  "action": "block",
-  "detector": "credential_assignment"
-}
-```
-
-Available names:
-
-| Detector | Checks |
+| Type | Purpose |
 |---|---|
-| `credential_assignment` | Password/key/token assignments |
-| `credential_field` | Supported JSON credential fields |
-| `private_key_block` | Paired private-key markers |
-| `supported_token_format` | Implemented token/identifier shapes |
-| `connection_string` | Credentials and selected signature parameters in text forms |
-| `credit_card` | Candidate format and Luhn checksum |
-| `iban` | Generic candidate format and mod-97 checksum |
-| `phone_candidate` | International `+`-prefixed number shapes |
-| `hash_candidate` | Common hexadecimal hash lengths |
-| `entropy_candidate` | Long, random-looking token shapes |
+| `dictionary` | Registered names/phrases with normalization and boundaries |
+| `exact_text` | Case-sensitive literal substring |
+| `url_domain` | Configured hosts/subdomains in URLs inside content |
+| `email` | Registered domains/addresses |
+| `ip_network` | Canonical configured IPv4/IPv6 CIDRs |
+| `field` | Registered JSON fields and exact values; empty values means any nonempty/non-redacted scalar |
+| `resource` | Registered literal resource strings |
+| `builtin` | Select a named detector |
 
-Detectors can overlap. Disabling one does not stop another matching the same content.
+Actions: `block` rejects; `audit` records and allows unless another rule blocks; disabled rules do not match. Any block wins. Rules operate over the whole inspected payload, not just the latest prompt.
 
-Rule IDs are logged. Use opaque IDs rather than sensitive names. IDs must be unique and contain only lowercase letters, digits, hyphens, or underscores, up to 64 characters. Invalid settings or duplicate IDs cause a policy error.
-
-See the public example and patch documentation for email, network, resource, and inspection settings.
-
-## Decoding and inspection limits
-
-The example enables percent, hex, and Base64 decoding up to two layers. Existing policies without the optional `inspection` settings default to decoding disabled.
-
-Supported decoded text is checked against the same rules. This does not decode every file or encoding: no images, compressed archives, arbitrary binary formats, or cross-message reconstruction.
-
-The default inspected-text limit is 2 MiB. The launcher's 10 MiB transport-body limit is separate. Exceeding inspection work/size limits produces `inspection_limit`.
-
-Capture limits and inspection limits are separate: saving a truncated capture does not deliberately reduce the content inspected by the blocker.
-
-## Test the installation
-
-Use synthetic credentials and fictional customers only.
-
-### Automated tests
-
-```bat
-.venv\Scripts\python.exe -m pytest -q tests\unit\test_request_capture.py tests\unit\test_payload_capture.py
-scripts\test-proxy-integration.cmd
-.venv\Scripts\python.exe tests\integration\run_rule_modes.py
-scripts\test-expanded-rules.cmd
-```
-
-For the supplied unchanged files:
-
-| Suite | Expected |
-|---|---|
-| Rules and capture unit suites | 70 + 17 tests |
-| Original local HTTP/WebSocket suite | 12 checks |
-| Rule-mode suite | 16 checks |
-| Expanded detector suite | 64 checks |
-
-The network suites start local servers and isolated proxies. They verify that allowed content arrives and rejected content does not. Timeouts are failures, not proof of blocking. The existing suites do not by themselves verify full-capture mode over the network, HTTPS/WSS certificate behavior, or Copilot retries.
-
-### Live checks
-
-In a fresh AI-client conversation, first send:
+Built-in names:
 
 ```text
-Reply with hello.
+credential_assignment
+credential_field
+private_key_block
+supported_token_format
+connection_string
+credit_card
+iban
+phone_candidate
+hash_candidate
+entropy_candidate
 ```
 
-It should pass. Then test an enabled credential rule:
+They detect supported patterns, not authentic/active credentials or accounts. Some overlap. Phone detection is shape-only. Hash/entropy candidates do not prove confidentiality; the example uses audit mode for uncertain categories.
 
-```text
-password = "Synthetic-Only-42"
-```
-
-It should block. With capture enabled, the normal attempt should have an `ALLOW` capture and the rejected attempt a `BLOCK` capture.
+See the example policy and prior patch documentation for each type's fields. Add aliases explicitly; dictionary matching does not infer names.
 
 ### Canary test
 
-Add or enable:
+Add/enable this rule in your private policy:
 
 ```json
 {
@@ -382,76 +278,70 @@ Add or enable:
 }
 ```
 
-Restart, start a fresh conversation, then send:
+Restart, create a fresh client conversation, check `hello`, then send the full marker. It should block. Disable after testing if not wanted. Discard the test conversation because the marker may be included in later context.
 
-```text
-Reply with exactly: SECRET_KEEPER_CONFIDENTIAL_CANARY
-```
+### Inspection settings
 
-Expect a canary block. Disable the rule afterward unless you want the marker blocked. Exact text means the literal sequence can appear anywhere in inspected content, not that the whole message must equal it.
+The example enables bounded percent/hex/Base64 decoding up to two layers. Old policies without `inspection` settings default to decoding disabled. Limits constrain input size, JSON depth, views, decoding depth, and decoded bytes.
 
-## Why a harmless prompt can block
+Default inspected text limit is 2 MiB, distinct from the launcher's 10 MiB transport body limit and capture caps. Exceedance produces `inspection_limit`. These are not complete CPU/resource or fail-closed guarantees.
 
-Secret Keeper checks the whole outgoing payload, including history/context when included by the client.
+## Paths and overrides
 
-```text
-Previous context: SECRET_KEEPER_CONFIDENTIAL_CANARY
-Newest prompt:    Reply with hello.
-```
-
-If both are sent together, an enabled canary rule correctly blocks. The same applies to secrets in included attachments or tool output. Use a new conversation after a blocking test; do not resume a contaminated session.
-
-## Rejections and logs
-
-HTTP blocks return local status 422 with `secret_keeper_blocked`. Outgoing WebSocket blocks drop the message. Your client may show an error, wait, or retry. Secret Keeper does not silently redact or rewrite prompts.
-
-The audit log remains metadata-only even when full capture is enabled. It contains decisions, time, transport, flow ID, rule/detector IDs, safe structural location, and final decision. It does not contain payload text.
-
-| Reason | Meaning |
+| Item | Default |
 |---|---|
-| Configured rule ID | Content matched a rule |
-| `policy_error` | Policy invalid or unavailable |
-| `inspection_error` | Content could not be inspected |
-| `inspection_limit` | Inspection size/work limit exceeded |
-| `body_unavailable` | Buffered HTTP body unavailable |
+| Private state | `%LOCALAPPDATA%\SecretKeeper` |
+| Private policy | State directory + `secret-keeper-policy.json` |
+| Audit | State directory + `logs\audit.jsonl` |
+| Capture | State directory + `captures\outbound.jsonl` |
+| Readable capture | Capture path + `.txt` |
 
-`body.text` describes an inspected representation, not necessarily the newest visible prompt.
+Set `SECRET_KEEPER_STATE` or `SECRET_KEEPER_POLICY` before running scripts to override defaults. Set the same custom state in both proxy and Copilot CMD windows. Reuse existing CA state for established clients.
 
-Old diagnostic logs are not erased by upgrades. Protect them as sensitive data. The metadata audit log has no automatic rotation; rotation options apply only to the new capture file.
+## Tests and verification status
 
-## Current limitations
+From CMD:
 
-Secret Keeper does not currently:
+```bat
+.venv\Scripts\python.exe -m pytest -q tests\unit\test_request_capture.py tests\unit\test_payload_capture.py tests\unit\test_readable_capture.py
+scripts\test-proxy-integration.cmd
+.venv\Scripts\python.exe tests\integration\run_rule_modes.py
+scripts\test-expanded-rules.cmd
+```
 
-- Inspect traffic bypassing the proxy or incoming WebSocket messages.
-- Inspect actual request headers or URL/query components.
-- Recognize every password, token, encoding, or indirect identity disclosure.
-- Reconstruct secrets split across messages.
-- Inspect images or arbitrary binary files.
-- Use an LLM to assess confidential meaning.
-- Provide complete administrator/resource hardening or fail-closed guarantees for unexpected addon/load failures.
+Earlier suites have 70 rule tests. This patch's 17 updated capture-helper and 18 formatting/viewer tests passed during generation; run the full installed suite too. The network suites expect 12, 16, and 64 checks respectively and require their earlier helper files.
 
-Keep it as one layer of protection, not your only confidentiality control.
+The maintainer previously verified local rule blocking, the initial 12 network checks, and capture behavior. Patch 08's formatter/viewer tests are executed during generation. Its new CMD scripts, current repository contents, fresh Windows clone, Copilot routing, and combined/network regressions require Windows validation. Do not claim a clean-clone end-to-end test from Linux-only helper tests.
 
-## Publishing and contributing safely
+The network suites check real local HTTP/WS server receipts with positive controls. Timeout is FAIL, not proof of rejection. They do not establish HTTPS/WSS certificate behavior or all client UX.
 
-Publish code, tests, documentation, and safe example policies. Keep private rules, captures, logs, environment files, and certificate state out of Git.
+## Troubleshooting
 
-The public policy example is `config/secret-keeper-policy.example.json`. A local `config/secret-keeper-policy.json` should be ignored; deployed policies should preferably live outside the checkout.
+| Problem | Check |
+|---|---|
+| Missing launcher/helper | Patch files not merged or extracted at wrong directory |
+| Python/venv missing | Python 3.12 launcher and setup command |
+| Port 8080 occupied | Stop the prior proxy instance |
+| Copilot certificate error | Proxy started, correct CA file/state, client trust configuration |
+| Canary does not block | Active policy, enabled rule, restart, actual client routing |
+| Harmless prompt blocks | Rule metadata and carried context; try a genuinely fresh session |
+| `policy_error` | Active file exists and schema/settings are valid |
+| `inspection_error` / `inspection_limit` | Inspectability and configured limits, not proof of a secret |
+| No readable file | Full capture enabled, Patch 08 helper present, warning/error messages |
+| Viewer fails at final record | Capture may have been interrupted mid-write; retain original for review |
 
-Review staged changes and history. Ignore rules do not remove previously committed content.
+Do not fix TLS problems by disabling verification. Do not upload raw captures to troubleshoot; share safe audit metadata instead.
 
-Contributions should include clear detector limits, allow/block tests, and synthetic false-positive examples. Never include real secrets or raw production traffic in issues or pull requests. Share safe metadata for diagnosis, not captured bodies.
+## Boundaries and publishing
+
+Not covered: bypassed traffic, incoming WebSocket messages, actual request headers or URL/query fields, arbitrary binary/files/images, every token/encoding, cross-message secrets, indirect identities, complete admin/resource hardening, or all unexpected addon failures.
+
+URL rules inspect URL text inside bodies; they are not destination allowlists. HTTP rejects use 422; WebSocket rejects drop the message. Client retries remain unfinished. No automatic redaction or LLM stage currently exists.
+
+Keep real policies, certificate state/private keys, captures, logs, `.venv`, and private environment files out of Git. Public example is `config/secret-keeper-policy.example.json`; local `config/secret-keeper-policy.json` should be ignored. Ignore rules do not erase history.
+
+Contribute safe synthetic fixtures, documented detector limits, allow/block cases, and false-positive examples. See `LICENSE` and `NOTICE` for terms/attribution.
 
 ## Next steps
 
-- Optional local/on-premises LLM classification for confidential meaning.
-- Better client rejection and retry behavior.
-- Wider detector and edge-case testing.
-- Stronger deployment, resource, and data-retention controls.
-
-These are plans, not current features.
-
-## License
-
-See `LICENSE` for terms and `NOTICE` for attribution.
+Optional local semantic validation, clearer client rejection, broader testing, and deployment/data-retention hardening. These are planned, not current protection guarantees.
