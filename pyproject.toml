@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secret-keeper-proxy"
+version = "0.1.0"
+description = "Explicit inspecting proxy foundation for a local outbound privacy gateway"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["mitmproxy>=11,<13"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+
+[project.scripts]
+secret-keeper = "secret_keeper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100

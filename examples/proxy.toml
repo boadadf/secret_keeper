@@ -1,0 +1,6 @@
+schema_version = 1
+
+[proxy]
+listen_host = "127.0.0.1"
+listen_port = 8080
+# Omit state_dir to use the per-user OS default. Never use the repository directory.

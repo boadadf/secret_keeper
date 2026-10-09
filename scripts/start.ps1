@@ -1,0 +1,1 @@
+& .\.venv\Scripts\secret-keeper.exe --config examples/proxy.toml start
