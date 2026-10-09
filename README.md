@@ -1,217 +1,457 @@
 # Secret Keeper
 
-Local outbound content-policy enforcement for AI-client traffic.
+Stop configured sensitive information from being sent to an external AI service.
 
-Secret Keeper is an experimental mitmproxy addon that inspects buffered HTTP request bodies and outgoing WebSocket payloads before forwarding them. It can reject configured names, synthetic canaries, and selected secret-like content.
+Secret Keeper runs between your AI tool and its server. It checks outgoing content against rules you control. If a blocking rule matches, it stops the request or message.
 
-It is not a complete data-loss prevention system, an endpoint firewall, or a guarantee that confidential information cannot leave a machine. Only traffic routed through the proxy and covered by its inspection logic is evaluated.
+You can block customer names, internal addresses, passwords, keys, and other information that must not leave your environment.
 
-## Current status
+**Important:** Only traffic passing through Secret Keeper is checked. It does not automatically protect every application or detect every possible secret.
 
-The current prototype is Patch 04. The maintainer reports successful live Copilot rule tests, including canary enforcement. The supplied addon test suite contains 21 synthetic tests. These do not establish controlled-upstream non-receipt or verify every client, transport, and detector combination.
+## How it works
 
-Known unfinished work includes controlled HTTP/WebSocket upstream tests, clearer client-facing rejection, retry handling, deployment hardening, and CMD launchers. These are planned, not shipped capabilities.
-
-## Features
-
-- Configurable dictionary of forbidden names, phrases, aliases, and identifiers.
-- Case folding, Unicode NFKC normalization, and whitespace normalization for dictionary matching.
-- Whole-phrase and substring dictionary boundaries.
-- Opt-in exact synthetic canary: `SECRET_KEEPER_CONFIDENTIAL_CANARY`.
-- Selected credential assignments and named JSON credential fields.
-- Paired private-key blocks.
-- Limited legacy GitHub token and AWS access-key-ID formats.
-- Buffered HTTP body inspection and outgoing UTF-8 WebSocket payload inspection.
-- Metadata-only audit records; enforcement does not depend on audit logging being enabled.
-
-AWS access-key IDs are identifiers, not the associated secret keys. Pattern matches indicate potential sensitive content, not verified active credentials.
-
-## Requirements and setup
-
-The demonstrated workflow uses Windows CMD, a Python virtual environment, mitmproxy, and pytest for tests. The addon imports mitmproxy and the Python standard library.
-
-For an isolated prototype environment, from the repository root:
-
-```bat
-py -m venv .venv
-.venv\Scripts\python.exe -m pip install mitmproxy pytest
+```text
+Your AI tool
+    |
+    v
+Secret Keeper checks the outgoing content
+    |
+    +-- Blocking rule matches --> Stop the request
+    |
+    +-- No blocking rule ------> Send it to the AI service
 ```
 
-If the repository provides pinned dependency files, use those instead. This README does not establish a supported Python/mitmproxy version matrix or a complete application installation procedure.
+The current rules run locally without an LLM. Secret Keeper does not send suspected credentials to a provider to check whether they work.
 
-HTTPS interception requires the client to trust the proxy's CA. Follow an approved certificate setup for your environment. Do not commit the CA private key or disable upstream TLS verification to bypass certificate problems. Clients may require explicit proxy settings or have certificate-pinning restrictions; starting the proxy does not automatically route their traffic through it.
+It inspects HTTP request bodies and outgoing WebSocket messages. These are two ways AI clients send information to their servers.
 
-## Private configuration
+## Current version
 
-Keep the real policy outside the checkout. Customer dictionaries and internal identifiers are confidential deployment data.
+Patch 07 adds optional payload capture to the rule blocker from Patch 06.
 
-In CMD:
+- The maintainer reports working live rule tests and working payload capture.
+- The earlier local HTTP/WebSocket test suite passed 12 checks.
+- Patch 06's 70 synthetic unit tests passed during package generation.
+- Patch 07's 17 capture-helper tests passed during package generation.
+- Run the combined tests and updated network suites on your installed version before declaring that release verified.
+
+Copilot's error presentation and retry delay remain unfinished. A test result applies to the tested scenarios, not every application, protocol, or secret.
+
+## What you can block
+
+| Information | Rule or detector |
+|---|---|
+| Company/customer names and aliases | Dictionary |
+| Fixed confidential markers | Exact text |
+| Internal URLs | Configured domains/subdomains |
+| Email addresses | Registered addresses or domains |
+| IPv4/IPv6 addresses | Configured network ranges |
+| Usernames and employee IDs | Registered structured fields and values |
+| Paths, bucket names, repository names | Registered resource strings |
+| Password/key/token assignments | Credential-assignment detector |
+| JSON credential fields | Credential-field detector |
+| Private-key blocks | Supported paired key markers |
+| Some provider token shapes | Supported-token detector |
+| Credential-bearing connection strings | Connection-string detector |
+| Encoded text | Bounded percent, hex, and Base64 decoding |
+| Card and IBAN candidates | Format/checksum detectors |
+| Phone, hash, random-looking strings | Optional candidate detectors |
+
+A pattern match does not prove a real secret exists. A public checksum, example credential, or protocol field can match. Phone detection is shape-only, not country-aware verification. Provider-token coverage is limited.
+
+The example policy puts card, IBAN, phone, hash, and entropy candidates in audit mode rather than blocking them.
+
+## Rule actions
+
+| Configuration | Behavior |
+|---|---|
+| Enabled + `block` | Stop matching content |
+| Enabled + `audit` | Record the match and allow it unless another rule blocks |
+| Disabled | Do not evaluate that rule |
+
+Any block wins, regardless of rule order. Audit mode does not prevent disclosure.
+
+## Windows setup
+
+Use Windows Command Prompt (CMD) for the documented workflow.
+
+From the repository root, install the declared development dependencies:
 
 ```bat
-set "STATE=%LOCALAPPDATA%\SecretKeeper"
-set "POLICY=%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json"
-set "LOG=%LOCALAPPDATA%\SecretKeeper\logs\audit.jsonl"
-if not exist "%STATE%" mkdir "%STATE%"
-notepad "%POLICY%"
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-For an existing installation, reuse the certificate-state directory already trusted by your client. Creating a different directory may create different CA material requiring a separate trust setup.
+This assumes the repository's `pyproject.toml` defines the `dev` extra. The supplied development setup script also uses Python 3.12.
 
-Save this minimal policy:
+Your client must be configured to use the proxy. For HTTPS interception, it must trust the proxy certificate. Starting the proxy does not configure the client automatically. Keep your existing working certificate setup; do not disable upstream TLS verification as a workaround.
+
+### Create a private policy
+
+Keep real company rules outside the checkout. The CMD launcher defaults to:
+
+```text
+%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json
+```
+
+For a new policy only:
+
+```bat
+if not exist "%LOCALAPPDATA%\SecretKeeper" mkdir "%LOCALAPPDATA%\SecretKeeper"
+if not exist "%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json" copy config\secret-keeper-policy.example.json "%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json"
+notepad "%LOCALAPPDATA%\SecretKeeper\secret-keeper-policy.json"
+```
+
+Review the fictional example before using it. Replace its sample values only in your private policy. Back up existing policies before changing them.
+
+### Start the proxy
+
+```bat
+scripts\capture-requests.cmd
+```
+
+The historical launcher name is unchanged. It starts the content-policy proxy, not full payload capture by default.
+
+The launcher uses:
+
+- `127.0.0.1:8080` as the listening address.
+- `%LOCALAPPDATA%\SecretKeeper` for certificate state.
+- A private policy outside the repository.
+- A metadata-only audit file under `%LOCALAPPDATA%\SecretKeeper\logs`.
+
+Keep it running in one CMD window and use another for your AI client. Stop it with `Ctrl+C`.
+
+For a different private policy:
+
+```bat
+set "SECRET_KEEPER_POLICY=C:\CompanyPolicy\secret-keeper-policy.json"
+scripts\capture-requests.cmd
+```
+
+The file must exist. Restart the proxy after policy edits.
+
+## Optional full payload capture — Patch 07
+
+Capture is off by default. Enable it only when you deliberately want to save outgoing content for later local analysis.
+
+It can save confidential information, including blocked attempts and old conversation context. Store captures outside Git, restrict access, and remove them after analysis.
+
+### Enable capture
+
+Stop the proxy. Add these options to the existing `mitmdump` command in your CMD launcher:
+
+```bat
+--set capture_mode=full --set "capture_file=%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl"
+```
+
+For a multiline launcher, its final section can be:
+
+```bat
+  --set "request_log=%LOG%" ^
+  --set "secret_keeper_policy=%SECRET_KEEPER_POLICY%" ^
+  --set capture_mode=full ^
+  --set "capture_file=%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl"
+```
+
+These are proxy command options, NOT fields in the rule-policy JSON. Audit and capture must use different files.
+
+Restart:
+
+```bat
+scripts\capture-requests.cmd
+```
+
+Look for:
+
+```text
+Secret Keeper FULL CAPTURE ACTIVE
+```
+
+`CAPTURE ERROR` means capture was disabled because the configuration was invalid or could not be used. `CAPTURE WRITE FAILED` means a record was not guaranteed saved. Neither intentionally disables rule enforcement.
+
+### What is saved
+
+- Attempted outgoing HTTP bodies and WebSocket payloads.
+- Allowed and blocked content.
+- Raw bytes stored as Base64.
+- Available decoded text.
+- Flow ID, time, transport, matched rule IDs, and final allow/block decision.
+
+The record uses `capture_stage: attempted_outbound`. `ALLOW` means permitted to forward, not proof that the destination received it.
+
+For HTTP, raw bytes may be compressed; available `body_text` is the text the addon inspected. Incoming messages, headers, full URLs, traffic bypassing the proxy, and files outside the payload are not captured.
+
+### Limits and rotation
+
+| Option | Default |
+|---|---|
+| `capture_mode` | `off` (`full` is the other supported value) |
+| `capture_file` | No default; required for full capture |
+| `capture_max_payload_bytes` | 1048576 — 1 MiB per raw/text representation |
+| `capture_max_file_bytes` | 16777216 — 16 MiB rotation size |
+| `capture_backups` | 3 rotated backups plus the current file |
+
+Larger representations are truncated. Records flag this using `raw_truncated` and `text_truncated`. Rotation removes the oldest backup. This is a rolling debugging capture, not a complete indefinite archive.
+
+There is no redacted capture mode, encryption-at-rest feature, automatic age expiry, or secure-erasure feature. Windows folder permissions need administrator review. Use one writer per capture file. Capture adds disk work and can increase latency.
+
+### View and disable capture
+
+```bat
+notepad "%LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl"
+```
+
+To disable it, remove the capture options or set:
+
+```bat
+--set capture_mode=off
+```
+
+Restart the proxy. Disabling capture does not delete old files. Do not publish captures or upload them automatically to an external AI service.
+
+## Configure blocking rules
+
+Schema version 2 uses a `rules` list:
 
 ```json
 {
-  "schema_version": 1,
-  "canary_enabled": false,
-  "secrets_enabled": true,
-  "dictionary": []
+  "schema_version": 2,
+  "rules": []
 }
 ```
 
-The addon also defaults to `config/secret-keeper-policy.json` when no explicit policy path is supplied. The public release should contain only a safe example policy; private local policies must not be tracked.
+An empty list allows inspectable content. Use it only intentionally. Version-1 policies remain supported and are converted internally without rewriting the source file.
 
-Policy edits require a proxy restart. Missing or invalid policies block requests with `policy_error`. A new policy path is not automatically populated.
-
-### Dictionary example
-
-Use fictional entries for testing:
+### Customer-name dictionary
 
 ```json
 {
-  "schema_version": 1,
-  "canary_enabled": false,
-  "secrets_enabled": true,
-  "dictionary": [
+  "schema_version": 2,
+  "rules": [
     {
-      "id": "test-customer-001",
-      "values": [
-        "Northstar Manufacturing",
-        "Northstar Manufacturing GmbH"
-      ],
-      "boundary": "whole_phrase"
+      "id": "customer-names",
+      "type": "dictionary",
+      "enabled": true,
+      "action": "block",
+      "matching": {
+        "case_sensitive": false,
+        "unicode_normalization": "NFKC",
+        "whitespace": "collapse",
+        "boundary": "whole_phrase"
+      },
+      "entries": [
+        {
+          "id": "customer-001",
+          "values": ["Northstar Manufacturing", "Northstar Manufacturing GmbH"]
+        }
+      ]
     }
   ]
 }
 ```
 
-Each entry must have exactly `id`, `values`, and `boundary`. IDs must be unique opaque lowercase letters, digits, hyphens, or underscores, up to 64 characters. Values must contain at least three normalized characters. Boundary is `whole_phrase` or `substring`.
+This matches different letter case and normalized whitespace. `Northstar` alone does not match the full registered phrase. Register aliases explicitly. `substring` instead of `whole_phrase` matches inside larger strings but can produce more unwanted matches.
 
-IDs are logged: do not use confidential customer names as IDs. Whole-phrase matching uses Unicode word boundaries; punctuation and filenames need deliberate test coverage. Substring matching can create more false positives.
+### Internal URLs
 
-## Run the proxy in CMD
+Add this rule to your list:
 
-From the repository root, in the same CMD window where the variables above were set:
-
-```bat
-.venv\Scripts\mitmdump.exe --mode regular --listen-host 127.0.0.1 --listen-port 8080 --set "confdir=%STATE%" --set ssl_insecure=false --set flow_detail=0 --set termlog_verbosity=error --set connection_strategy=lazy --set body_size_limit=10m -s src\secret_keeper\request_capture.py --set "request_log=%LOG%" --set "secret_keeper_policy=%POLICY%"
+```json
+{
+  "id": "internal-urls",
+  "type": "url_domain",
+  "enabled": true,
+  "action": "block",
+  "domains": ["example.internal"],
+  "include_subdomains": true
+}
 ```
 
-Keep the filename `request_capture.py`: despite its historical name, it now performs inspection and enforcement. The log is metadata-only in Patch 04.
+It checks URLs inside content, not which servers an application may contact.
 
-Use a second CMD window to run your AI client with its existing working proxy and certificate configuration. This README does not claim a universal Copilot configuration command. Keep port 8080 free by stopping any earlier proxy instance.
+### Usernames in structured fields
 
-The 10 MB setting is an operational body limit, not a complete resource-control or no-leak guarantee. Error verbosity hides informational startup messages; block and policy-error messages remain visible.
-
-## Test
-
-### Automated addon tests
-
-```bat
-.venv\Scripts\python.exe -m pytest -q tests\unit\test_request_capture.py
+```json
+{
+  "id": "registered-usernames",
+  "type": "field",
+  "enabled": true,
+  "action": "block",
+  "fields": ["username", "login", "employee_id"],
+  "values": ["synthetic-user-001"],
+  "case_sensitive": false
+}
 ```
 
-For the unchanged Patch 04 test file, expect 21 passing tests. Tests substitute mitmproxy objects and validate decisions and hook calls, not actual network forwarding. Run the full repository suite separately where applicable.
+This matches registered structured fields. Use a dictionary to match a username in ordinary prose. An empty `values` list means any nonempty, non-redacted scalar in those fields can match.
 
-### Live allow/block checks
+### Built-in detectors
 
-Use only synthetic credentials and fictional customers. Start a fresh session for each blocking case.
+```json
+{
+  "id": "credential-assignments",
+  "type": "builtin",
+  "enabled": true,
+  "action": "block",
+  "detector": "credential_assignment"
+}
+```
 
-| Input | Expected outcome |
-| --- | --- |
-| `Reply with hello.` | Allow |
-| `Explain how passwords work.` | Allow |
-| `Explain what an API key is.` | Allow |
-| `password = "Synthetic-Only-42"` | Block: credential assignment |
-| `{"client_secret":"Synthetic-Only-42"}` | Block: credential assignment or field |
-| `Northstar Manufacturing` | Block only when the example dictionary is loaded |
-| `Northstar` | Allow under the example whole-phrase dictionary |
+Available names:
 
-For the canary test, set `canary_enabled` to `true`, restart the proxy, and start a fresh client session. First check that `Reply with hello.` passes, then send:
+| Detector | Checks |
+|---|---|
+| `credential_assignment` | Password/key/token assignments |
+| `credential_field` | Supported JSON credential fields |
+| `private_key_block` | Paired private-key markers |
+| `supported_token_format` | Implemented token/identifier shapes |
+| `connection_string` | Credentials and selected signature parameters in text forms |
+| `credit_card` | Candidate format and Luhn checksum |
+| `iban` | Generic candidate format and mod-97 checksum |
+| `phone_candidate` | International `+`-prefixed number shapes |
+| `hash_candidate` | Common hexadecimal hash lengths |
+| `entropy_candidate` | Long, random-looking token shapes |
+
+Detectors can overlap. Disabling one does not stop another matching the same content.
+
+Rule IDs are logged. Use opaque IDs rather than sensitive names. IDs must be unique and contain only lowercase letters, digits, hyphens, or underscores, up to 64 characters. Invalid settings or duplicate IDs cause a policy error.
+
+See the public example and patch documentation for email, network, resource, and inspection settings.
+
+## Decoding and inspection limits
+
+The example enables percent, hex, and Base64 decoding up to two layers. Existing policies without the optional `inspection` settings default to decoding disabled.
+
+Supported decoded text is checked against the same rules. This does not decode every file or encoding: no images, compressed archives, arbitrary binary formats, or cross-message reconstruction.
+
+The default inspected-text limit is 2 MiB. The launcher's 10 MiB transport-body limit is separate. Exceeding inspection work/size limits produces `inspection_limit`.
+
+Capture limits and inspection limits are separate: saving a truncated capture does not deliberately reduce the content inspected by the blocker.
+
+## Test the installation
+
+Use synthetic credentials and fictional customers only.
+
+### Automated tests
+
+```bat
+.venv\Scripts\python.exe -m pytest -q tests\unit\test_request_capture.py tests\unit\test_payload_capture.py
+scripts\test-proxy-integration.cmd
+.venv\Scripts\python.exe tests\integration\run_rule_modes.py
+scripts\test-expanded-rules.cmd
+```
+
+For the supplied unchanged files:
+
+| Suite | Expected |
+|---|---|
+| Rules and capture unit suites | 70 + 17 tests |
+| Original local HTTP/WebSocket suite | 12 checks |
+| Rule-mode suite | 16 checks |
+| Expanded detector suite | 64 checks |
+
+The network suites start local servers and isolated proxies. They verify that allowed content arrives and rejected content does not. Timeouts are failures, not proof of blocking. The existing suites do not by themselves verify full-capture mode over the network, HTTPS/WSS certificate behavior, or Copilot retries.
+
+### Live checks
+
+In a fresh AI-client conversation, first send:
+
+```text
+Reply with hello.
+```
+
+It should pass. Then test an enabled credential rule:
+
+```text
+password = "Synthetic-Only-42"
+```
+
+It should block. With capture enabled, the normal attempt should have an `ALLOW` capture and the rejected attempt a `BLOCK` capture.
+
+### Canary test
+
+Add or enable:
+
+```json
+{
+  "id": "synthetic-canary",
+  "type": "exact_text",
+  "enabled": true,
+  "action": "block",
+  "value": "SECRET_KEEPER_CONFIDENTIAL_CANARY"
+}
+```
+
+Restart, start a fresh conversation, then send:
 
 ```text
 Reply with exactly: SECRET_KEEPER_CONFIDENTIAL_CANARY
 ```
 
-Expect a `test_canary` block. Disable the canary afterward unless you want the synthetic detector active.
+Expect a canary block. Disable the rule afterward unless you want the marker blocked. Exact text means the literal sequence can appear anywhere in inspected content, not that the whole message must equal it.
 
-The entire inspected payload is checked, not only the latest prompt. A marker or secret in conversation history, attached context, or tool output can block a subsequent harmless prompt. Do not resume a contaminated test conversation when checking normal behavior.
+## Why a harmless prompt can block
 
-### Verification still required
+Secret Keeper checks the whole outgoing payload, including history/context when included by the client.
 
-Controlled upstream integration tests must confirm that allowed content arrives and rejected HTTP bodies/WebSocket messages do not. A local block log alone does not prove non-receipt. Authentication and protocol metadata may still be exchanged.
+```text
+Previous context: SECRET_KEEPER_CONFIDENTIAL_CANARY
+Newest prompt:    Reply with hello.
+```
 
-## Blocking behavior
+If both are sent together, an enabled canary rule correctly blocks. The same applies to secrets in included attachments or tool output. Use a new conversation after a blocking test; do not resume a contaminated session.
 
-HTTP rejection produces a local 422 JSON response containing `secret_keeper_blocked`. The client may display its own error or retry. This is not a verified provider-compatible rejection format.
+## Rejections and logs
 
-Outgoing WebSocket rejection drops the message. The client may wait, time out, or retry because no compatible application-level error is injected. Retry UX is unresolved.
+HTTP blocks return local status 422 with `secret_keeper_blocked`. Outgoing WebSocket blocks drop the message. Your client may show an error, wait, or retry. Secret Keeper does not silently redact or rewrite prompts.
 
-No automatic redaction is performed. Changing text silently is intentionally not part of the current prototype.
+The audit log remains metadata-only even when full capture is enabled. It contains decisions, time, transport, flow ID, rule/detector IDs, safe structural location, and final decision. It does not contain payload text.
 
-## Audit and troubleshooting
-
-Audit records contain timestamp, flow ID, transport, decision, rule ID, optional opaque dictionary entry ID, and numeric structural location. They omit payloads, matched values, URL paths, headers, and JSON field names.
-
-| Rule ID | Meaning |
-| --- | --- |
-| `test_canary` | Exact enabled test marker matched |
-| `dictionary` | Configured dictionary entry matched |
-| `credential_assignment` | Text assignment matched |
-| `credential_field` | Named JSON credential field contained a non-placeholder string |
-| `private_key_block` | Paired private-key delimiters matched |
-| `supported_token_format` | One of the implemented token/identifier formats matched |
-| `policy_error` | Policy unavailable or invalid |
+| Reason | Meaning |
+|---|---|
+| Configured rule ID | Content matched a rule |
+| `policy_error` | Policy invalid or unavailable |
 | `inspection_error` | Content could not be inspected |
+| `inspection_limit` | Inspection size/work limit exceeded |
 | `body_unavailable` | Buffered HTTP body unavailable |
 
-`body.text` means JSON parsing did not succeed and matching ran on text. It is not evidence that the newest prompt contained the match. Structural locations use numeric positions to avoid exposing user-controlled JSON keys.
+`body.text` describes an inspected representation, not necessarily the newest visible prompt.
 
-Earlier capture versions stored bodies. Patch 04 does not erase existing logs: protect or securely dispose of previous capture files according to your retention policy. Windows filesystem ACLs and access controls require deployment-specific review. Logs have no built-in rotation in this prototype.
+Old diagnostic logs are not erased by upgrades. Protect them as sensitive data. The metadata audit log has no automatic rotation; rotation options apply only to the new capture file.
 
-## Security boundaries and limitations
+## Current limitations
 
-- Only routed, successfully intercepted traffic is covered.
-- Headers and URL/query parameters are not inspected by Patch 04.
-- No Base64 decoding, image/OCR inspection, arbitrary binary protocol parsing, or cross-message reassembly.
-- WebSocket payloads must decode as UTF-8; uninspectable payloads block.
-- No general bare-password or semantic confidentiality detector.
-- Token patterns cover a limited subset, not every provider or token generation.
-- Credential examples, code snippets, and legitimate protocol fields may create false positives.
-- Legitimate authentication headers are not scanned; they are not a general bypass for secrets in bodies.
-- Unexpected addon exceptions and load failures are not a hardened fail-closed boundary.
-- Policy administration, resource bounds, long-lived WebSocket retention, and log lifecycle need hardening.
-- Dictionaries cannot guarantee that an identity is never disclosed indirectly or through unregistered aliases.
+Secret Keeper does not currently:
 
-Do not deploy this prototype as your sole confidentiality control or claim universal no-leak protection.
+- Inspect traffic bypassing the proxy or incoming WebSocket messages.
+- Inspect actual request headers or URL/query components.
+- Recognize every password, token, encoding, or indirect identity disclosure.
+- Reconstruct secrets split across messages.
+- Inspect images or arbitrary binary files.
+- Use an LLM to assess confidential meaning.
+- Provide complete administrator/resource hardening or fail-closed guarantees for unexpected addon/load failures.
 
-## Contributing and publishing safely
+Keep it as one layer of protection, not your only confidentiality control.
 
-Contributions should include allow and block tests, false-positive cases, safe fixtures, and an accurate description of transport coverage. Never submit real customer names, tokens, passwords, private keys, or raw traffic in issues or pull requests.
+## Publishing and contributing safely
 
-Before pushing, inspect staged changes and repository history. Keep local policies, `.venv`, `.env` files, logs, captures, and CA state out of Git. Ignore rules do not remove previously committed content. Rotate exposed credentials and assess history cleanup when necessary.
+Publish code, tests, documentation, and safe example policies. Keep private rules, captures, logs, environment files, and certificate state out of Git.
 
-The repository should ship a fictional or empty example configuration rather than a company's deployed dictionary. Any new features must be documented as implemented, tested, or planned without conflating those states.
+The public policy example is `config/secret-keeper-policy.example.json`. A local `config/secret-keeper-policy.json` should be ignored; deployed policies should preferably live outside the checkout.
 
-## Roadmap
+Review staged changes and history. Ignore rules do not remove previously committed content.
 
-- Controlled HTTP and WebSocket upstream integration tests.
-- CMD launchers and safe first-run policy initialization.
-- Public/private configuration packaging.
-- Better safe request classification and match diagnostics.
-- Verified client-facing rejection and retry behavior.
-- Expanded format detectors with documented false-positive tradeoffs.
-- Deployment hardening and administrator-managed policies.
+Contributions should include clear detector limits, allow/block tests, and synthetic false-positive examples. Never include real secrets or raw production traffic in issues or pull requests. Share safe metadata for diagnosis, not captured bodies.
+
+## Next steps
+
+- Optional local/on-premises LLM classification for confidential meaning.
+- Better client rejection and retry behavior.
+- Wider detector and edge-case testing.
+- Stronger deployment, resource, and data-retention controls.
+
+These are plans, not current features.
 
 ## License
 
-Check the repository's `LICENSE` file for applicable terms. No license choice is asserted by this README. Select and include an explicit license before describing the release as open source.
+See `LICENSE` for terms and `NOTICE` for attribution.

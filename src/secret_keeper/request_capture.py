@@ -1,187 +1,91 @@
-"""Standalone mitmproxy addon. Policy is loaded at startup; restart after edits."""
+"""mitmproxy entry point: deterministic rules plus opt-in payload capture."""
+import importlib.util
 import json
+import logging
 import os
-import re
-import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime,timezone
 from pathlib import Path
-from mitmproxy import ctx, http
+from mitmproxy import ctx,http
 
-CANARY = "SECRET_KEEPER_CONFIDENTIAL_CANARY"
-DEFAULT_POLICY = Path(__file__).resolve().parents[2] / "config" / "secret-keeper-policy.json"
-FIELDS = {"password", "passwd", "pwd", "apikey", "apisecret", "clientsecret", "accesstoken", "refreshtoken", "secretkey", "privatekey"}
-PRIVATE = re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")
-TOKENS = re.compile(r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36}|AKIA[A-Z0-9]{16})(?![A-Za-z0-9_])")
-ASSIGN = re.compile(r"(?i)\b(password|passwd|pwd|api[_-]?key|api[_-]?secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|secret[_-]?key)\b\s*[:=]\s*(?:\"([^\"\r\n]+)\"|'([^'\r\n]+)'|([^\s,;\}\]]+))")
+def adjacent(name,filename):
+    spec=importlib.util.spec_from_file_location(name,Path(__file__).with_name(filename))
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    return module
 
-
-def normalize(value):
-    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
-
-
-def credential(value):
-    value = value.strip()
-    # Narrow placeholders only. This is not a general validation of secret authenticity.
-    return bool(value) and value.casefold() not in {"<redacted>", "[redacted]", "***", "${password}", "${api_key}"}
-
-
-def validate_policy(policy):
-    if not isinstance(policy, dict) or set(policy) - {"schema_version", "canary_enabled", "secrets_enabled", "dictionary"}:
-        raise ValueError("unknown policy field")
-    if policy.get("schema_version") != 1:
-        raise ValueError("unsupported policy schema")
-    for key in ("canary_enabled", "secrets_enabled"):
-        if type(policy.get(key)) is not bool:
-            raise ValueError("policy booleans required")
-    entries = policy.get("dictionary")
-    if not isinstance(entries, list):
-        raise ValueError("dictionary must be a list")
-    seen = set()
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"id", "values", "boundary"}:
-            raise ValueError("invalid dictionary entry")
-        ident = entry["id"]
-        if not isinstance(ident, str) or not re.fullmatch(r"[a-z0-9_-]{1,64}", ident) or ident in seen:
-            raise ValueError("invalid or duplicate opaque entry ID")
-        seen.add(ident)
-        if entry["boundary"] not in {"whole_phrase", "substring"}:
-            raise ValueError("invalid boundary")
-        if not isinstance(entry["values"], list) or not entry["values"]:
-            raise ValueError("values required")
-        if any(not isinstance(v, str) or len(normalize(v)) < 3 for v in entry["values"]):
-            raise ValueError("dictionary values must contain at least three normalized characters")
-    return policy
-
+_rules=adjacent("secret_keeper_local_rules","rules.py")
+_capture=adjacent("secret_keeper_payload_capture","payload_capture.py")
+validate_policy=_rules.validate_policy
+inspect=_rules.inspect
+CANARY=_rules.CANARY
+DEFAULT_POLICY=Path(__file__).resolve().parents[2]/"config"/"secret-keeper-policy.json"
+LOG=logging.getLogger("secret_keeper.proxy")
 
 class RequestCapture:
     def __init__(self):
-        self.policy = None
-        self.policy_error = False
-
-    def load(self, loader):
-        loader.add_option("request_log", str, "", "Opt-in metadata-only JSONL audit path")
-        loader.add_option("secret_keeper_policy", str, str(DEFAULT_POLICY), "Local JSON policy file")
-
-    def configure(self, updated):
+        self.policy=None;self.policy_error=True;self.capture=_capture.PayloadCapture()
+    def load(self,loader):
+        loader.add_option("request_log",str,"","Metadata-only JSONL audit path")
+        loader.add_option("secret_keeper_policy",str,str(DEFAULT_POLICY),"Private JSON policy path")
+        self.capture.load(loader)
+    def configure(self,updated):
+        if not self.capture.ready or set(updated)&{"capture_mode","capture_file","capture_max_payload_bytes","capture_max_file_bytes","capture_backups","request_log"}:
+            self.capture.configure(ctx.options)
         if self.policy is None or "secret_keeper_policy" in updated:
             try:
-                self.policy = validate_policy(json.loads(Path(ctx.options.secret_keeper_policy).read_text(encoding="utf-8")))
-                self.policy_error = False
-                ctx.log.info("Secret Keeper policy loaded; canary=" + str(self.policy["canary_enabled"]))
-            except (OSError, ValueError, TypeError):
-                self.policy_error = True
-                ctx.log.error("Secret Keeper POLICY ERROR: fix local policy and restart; requests will be blocked")
-
-    def requestheaders(self, flow: http.HTTPFlow):
-        flow.request.stream = False
-
-    def responseheaders(self, flow: http.HTTPFlow):
-        flow.response.stream = True
-
-    def text_match(self, text, location):
-        policy = self.policy
-        if policy["canary_enabled"] and CANARY in text:
-            return {"rule_id": "test_canary", "location": location}
-        norm = normalize(text)
-        for entry in policy["dictionary"]:
-            for value in entry["values"]:
-                phrase = re.escape(normalize(value))
-                pattern = phrase if entry["boundary"] == "substring" else r"(?<!\w)" + phrase + r"(?!\w)"
-                if re.search(pattern, norm):
-                    return {"rule_id": "dictionary", "entry_id": entry["id"], "location": location}
-        if policy["secrets_enabled"]:
-            if PRIVATE.search(text):
-                return {"rule_id": "private_key_block", "location": location}
-            if TOKENS.search(text):
-                return {"rule_id": "supported_token_format", "location": location}
-            for match in ASSIGN.finditer(text):
-                if credential(next(v for v in match.groups()[1:] if v is not None)):
-                    return {"rule_id": "credential_assignment", "location": location}
-        return None
-
-    def inspect(self, text):
-        if self.policy_error or self.policy is None:
-            return {"rule_id": "policy_error", "location": "policy"}
-        try:
-            value = json.loads(text)
-        except ValueError:
-            return self.text_match(text, "body.text")
-        stack = [(value, "body", None)]
-        while stack:
-            item, location, field = stack.pop()
-            if isinstance(item, str):
-                if self.policy["secrets_enabled"] and field in FIELDS and credential(item):
-                    return {"rule_id": "credential_field", "location": location}
-                result = self.text_match(item, location)
-                if result:
-                    return result
-            elif isinstance(item, dict):
-                for index, (key, val) in enumerate(item.items()):
-                    # Numeric positions avoid logging customer-supplied JSON keys.
-                    loc = location + ".object[" + str(index) + "]"
-                    result = self.text_match(key, loc + ".key")
-                    if result:
-                        return result
-                    field_name = re.sub(r"[^a-z]", "", key.casefold())
-                    stack.append((val, loc + ".value", field_name))
-            elif isinstance(item, list):
-                stack.extend((val, location + ".array[" + str(i) + "]", field) for i, val in enumerate(item))
-        # Also check serialized text for structured sequences crossing JSON values.
-        return self.text_match(text, "body.serialized")
-
-    def audit(self, flow, transport, decision, details=None):
-        record = {"schema_version": 4, "timestamp": datetime.now(timezone.utc).isoformat(),
-                  "flow_id": flow.id, "transport": transport, "direction": "client_to_server",
-                  "decision": decision}
+                path=Path(ctx.options.secret_keeper_policy)
+                if path.stat().st_size>2097152:raise ValueError("policy size")
+                self.policy=validate_policy(json.loads(path.read_text(encoding="utf-8")))
+                self.policy_error=False
+                LOG.info("Secret Keeper loaded schema %s, %s rules",self.policy["source_schema_version"],len(self.policy["rules"]))
+            except (OSError,ValueError,TypeError,RecursionError):
+                self.policy=None;self.policy_error=True
+                LOG.error("Secret Keeper POLICY ERROR: fix private policy and restart; requests will reject")
+    def requestheaders(self,flow:http.HTTPFlow):flow.request.stream=False
+    def responseheaders(self,flow:http.HTTPFlow):flow.response.stream=True
+    def evaluate(self,text):
+        if self.policy_error or self.policy is None:return [{"rule_id":"policy_error","action":"block","location":"policy"}]
+        return inspect(self.policy,text)
+    def audit(self,flow,transport,decision,details=None):
+        record={"schema_version":6,"timestamp":datetime.now(timezone.utc).isoformat(),"flow_id":flow.id,"transport":transport,"direction":"client_to_server","decision":decision}
         record.update(details or {})
-        if decision == "BLOCK":
-            ctx.log.error("Secret Keeper BLOCK " + json.dumps(record, ensure_ascii=True))
-        path = ctx.options.request_log
-        if not path:
-            return
+        if decision in ("BLOCK","AUDIT"):LOG.error("Secret Keeper %s %s",decision,json.dumps(record,ensure_ascii=True))
+        if not ctx.options.request_log:return
         try:
-            target = Path(path).expanduser()
-            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8") as out:
-                out.write(json.dumps(record, ensure_ascii=True) + "\n")
-        except OSError:
-            ctx.log.error("Secret Keeper audit write failed")
-
-    def request(self, flow: http.HTTPFlow):
+            path=Path(ctx.options.request_log).expanduser();path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+            fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+            with os.fdopen(fd,"a",encoding="utf-8") as stream:stream.write(json.dumps(record,ensure_ascii=True)+"\n")
+        except OSError:LOG.error("Secret Keeper audit write failed")
+    def record_matches(self,flow,transport,matches):
+        blocked=any(m["action"]=="block" for m in matches)
+        for match in matches:self.audit(flow,transport,"BLOCK" if match["action"]=="block" else "AUDIT",dict(match,final_decision="BLOCK" if blocked else "ALLOW"))
+        if not blocked:self.audit(flow,transport,"ALLOW")
+    def failure(self,rule):return [{"rule_id":rule,"action":"block","location":"body"}]
+    def request(self,flow:http.HTTPFlow):
+        raw=None;text=None
         try:
-            raw = flow.request.raw_content
-            if raw is None:
-                result = {"rule_id": "body_unavailable", "location": "body"}
+            raw=flow.request.raw_content
+            if raw is None:matches=self.failure("body_unavailable")
             else:
-                text = flow.request.get_text(strict=True)
-                result = self.inspect(text or "")
-        except (ValueError, RecursionError):
-            result = {"rule_id": "inspection_error", "location": "body"}
-        if result:
-            flow.response = http.Response.make(422,
-                json.dumps({"error": {"code": "secret_keeper_blocked", "message": "Local content policy rejected this request.",
-                                      "rule_id": result["rule_id"]}}).encode(),
-                {"Content-Type": "application/json", "Cache-Control": "no-store"})
-            self.audit(flow, "http", "BLOCK", result)
-        else:
-            self.audit(flow, "http", "ALLOW")
-
-    def websocket_message(self, flow: http.HTTPFlow):
-        if not flow.websocket or not flow.websocket.messages:
-            return
-        message = flow.websocket.messages[-1]
-        if not message.from_client:
-            return
+                text=flow.request.get_text(strict=True) or ""
+                matches=self.evaluate(text)
+        except _rules.InspectionLimit:matches=self.failure("inspection_limit")
+        except (ValueError,RecursionError):matches=self.failure("inspection_error")
+        block=next((m for m in matches if m["action"]=="block"),None)
+        if block:flow.response=http.Response.make(422,json.dumps({"error":{"code":"secret_keeper_blocked","message":"Local content policy rejected this request.","rule_id":block["rule_id"]}}).encode(),{"Content-Type":"application/json","Cache-Control":"no-store"})
+        self.record_matches(flow,"http",matches)
+        self.capture.write(flow,"http",matches,raw,text)
+    def websocket_message(self,flow:http.HTTPFlow):
+        if not flow.websocket or not flow.websocket.messages:return
+        message=flow.websocket.messages[-1]
+        if not message.from_client:return
+        text=None
         try:
-            result = self.inspect(message.content.decode("utf-8", errors="strict"))
-        except (ValueError, RecursionError):
-            result = {"rule_id": "inspection_error", "location": "body"}
-        if result:
-            message.drop()
-            self.audit(flow, "websocket", "BLOCK", result)
-        else:
-            self.audit(flow, "websocket", "ALLOW")
+            text=message.content.decode("utf-8",errors="strict")
+            matches=self.evaluate(text)
+        except _rules.InspectionLimit:matches=self.failure("inspection_limit")
+        except (ValueError,RecursionError):matches=self.failure("inspection_error")
+        if any(m["action"]=="block" for m in matches):message.drop()
+        self.record_matches(flow,"websocket",matches)
+        self.capture.write(flow,"websocket",matches,message.content,text,len(flow.websocket.messages)-1)
 
-
-addons = [RequestCapture()]
+addons=[RequestCapture()]
