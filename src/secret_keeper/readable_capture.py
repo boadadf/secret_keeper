@@ -51,6 +51,7 @@ def readable(record,width=100,max_chars=2097152):
     add("OUTGOING PAYLOAD — "+str(record.get("transport","unknown")).upper()+" — "+str(record.get("final_decision","UNKNOWN")))
     add("Time: "+str(record.get("timestamp","unknown")))
     add("Flow: "+str(record.get("flow_id","unknown")))
+    if "destination" in record:add("Destination: "+str(record["destination"]))
     add("Stage: attempted outbound content; ALLOW does not prove destination receipt.")
     add("Rules: "+(", ".join(str(x) for x in record.get("matched_rule_ids",[])) or "none"))
     if "message_index" in record:add("WebSocket message index: "+str(record["message_index"]))

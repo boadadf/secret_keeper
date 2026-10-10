@@ -13,6 +13,7 @@ def adjacent(name,filename):
     return module
 
 _rules=adjacent("secret_keeper_local_rules","rules.py")
+_reply=adjacent("secret_keeper_reply","ws_response_builder.py")
 _capture=adjacent("secret_keeper_payload_capture","payload_capture.py")
 validate_policy=_rules.validate_policy
 inspect=_rules.inspect
@@ -23,10 +24,12 @@ LOG=logging.getLogger("secret_keeper.proxy")
 class RequestCapture:
     def __init__(self):
         self.policy=None;self.policy_error=True;self.capture=_capture.PayloadCapture()
+        self.ws_active={};self.ws_local_ids={}
     def load(self,loader):
         loader.add_option("request_log",str,"","Metadata-only JSONL audit path")
         loader.add_option("secret_keeper_policy",str,str(DEFAULT_POLICY),"Private JSON policy path")
         self.capture.load(loader)
+        loader.add_option("secret_keeper_ws_client",str,"copilot","WebSocket reply format: copilot/none")
     def configure(self,updated):
         if not self.capture.ready or set(updated)&{"capture_mode","capture_file","capture_max_payload_bytes","capture_max_file_bytes","capture_backups","request_log"}:
             self.capture.configure(ctx.options)
@@ -71,21 +74,62 @@ class RequestCapture:
         except _rules.InspectionLimit:matches=self.failure("inspection_limit")
         except (ValueError,RecursionError):matches=self.failure("inspection_error")
         block=next((m for m in matches if m["action"]=="block"),None)
-        if block:flow.response=http.Response.make(422,json.dumps({"error":{"code":"secret_keeper_blocked","message":"Local content policy rejected this request.","rule_id":block["rule_id"]}}).encode(),{"Content-Type":"application/json","Cache-Control":"no-store"})
+        if block:
+            flow.response=http.Response.make(422,json.dumps({"error":{"type":"policy_violation","code":"secret_keeper_blocked","message":_reply.NOTICE,"rule_id":block["rule_id"],"reference":flow.id}}).encode(),{"Content-Type":"application/json","Cache-Control":"no-store","X-SecretKeeper-Blocked":"true"})
+            LOG.warning("SecretKeeper prevented an outbound disclosure. Retry with less context or start a new session. Details: rule=%s reference=%s",block["rule_id"],flow.id)
         self.record_matches(flow,"http",matches)
         self.capture.write(flow,"http",matches,raw,text)
-    def websocket_message(self,flow:http.HTTPFlow):
+    def websocket_end(self, flow):
+        self.ws_active.pop(flow.id, None)
+        self.ws_local_ids.pop(flow.id, None)
+    def ws_stop(self, flow, reason):
+        self.audit(flow,"websocket","BLOCK",{"rule_id":reason,"action":"block","location":"adapter","final_decision":"BLOCK","reply":"connection_terminated"})
+        flow.kill()
+    def websocket_message(self, flow):
         if not flow.websocket or not flow.websocket.messages:return
         message=flow.websocket.messages[-1]
-        if not message.from_client:return
-        text=None
+        if getattr(message,"injected",False):return
+        text=None;payload=None
         try:
             text=message.content.decode("utf-8",errors="strict")
-            matches=self.evaluate(text)
+            parsed=json.loads(text)
+            if isinstance(parsed,dict):payload=parsed
+        except (ValueError,RecursionError):pass
+        if not message.from_client:
+            if payload and payload.get("type") in ("response.completed","response.failed","response.incomplete"):
+                self.ws_active[flow.id]=max(0,self.ws_active.get(flow.id,0)-1)
+            return
+        try:matches=self.evaluate(text) if text is not None else self.failure("inspection_error")
         except _rules.InspectionLimit:matches=self.failure("inspection_limit")
         except (ValueError,RecursionError):matches=self.failure("inspection_error")
-        if any(m["action"]=="block" for m in matches):message.drop()
+        previous=payload.get("previous_response_id") if payload else None
+        if isinstance(previous,str) and previous in self.ws_local_ids.get(flow.id,set()):
+            matches.append({"rule_id":"local_response_continuation","action":"block","location":"adapter"})
+        blocked=any(m["action"]=="block" for m in matches)
+        if blocked:message.drop()
         self.record_matches(flow,"websocket",matches)
         self.capture.write(flow,"websocket",matches,message.content,text,len(flow.websocket.messages)-1)
+        if not blocked:
+            if payload and payload.get("type")=="response.create":self.ws_active[flow.id]=self.ws_active.get(flow.id,0)+1
+            return
+        LOG.warning("SecretKeeper prevented an outbound disclosure. Retry with less context or start a new session. Reference=%s",flow.id)
+        mode=getattr(ctx.options,"secret_keeper_ws_client","copilot")
+        if mode=="none":
+            self.ws_stop(flow,"ws_reply_disabled");return
+        if mode!="copilot" or not payload or payload.get("type")!="response.create":
+            self.ws_stop(flow,"ws_protocol_unsupported");return
+        if self.ws_active.get(flow.id,0):
+            self.ws_stop(flow,"ws_concurrent_response_unsupported");return
+        try:
+            ids=self.ws_local_ids.setdefault(flow.id,set())
+            if len(ids)>=1024:self.ws_stop(flow,"ws_state_limit");return
+            events=_reply.build_events(payload)
+            ids.add(events[-1]["response"]["id"])
+            for event in events:
+                ctx.master.commands.call("inject.websocket",flow,True,json.dumps(event,ensure_ascii=False,separators=(",",":")).encode("utf-8"))
+            self.audit(flow,"websocket","BLOCK",{"rule_id":"ws_local_reply","action":"block","location":"adapter","final_decision":"BLOCK","reply":"synthetic_completed","event_count":len(events)})
+        except Exception:
+            LOG.error("SecretKeeper WS notification failed; terminating blocked flow")
+            flow.kill()
 
 addons=[RequestCapture()]

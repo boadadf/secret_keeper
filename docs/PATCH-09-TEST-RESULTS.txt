@@ -1,0 +1,7 @@
+........................................................................ [ 62%]
+............................................                             [100%]
+116 passed, 3 deselected in 0.20s
+
+
+Excluded: viewer_filter, viewer_bad_record, quickstart_files (unprovided repository files).
+Windows/live proxy integration not executed.

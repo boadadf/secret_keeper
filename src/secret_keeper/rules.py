@@ -22,11 +22,55 @@ TOKENS = re.compile(r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[
 ASSIGN = re.compile(r"(?i)\b(password|passwd|pwd|api[_-]?key|api[_-]?secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|secret[_-]?key)\b\s*[:=]\s*(?:\"([^\"\r\n]{1,8192})\"|'([^'\r\n]{1,8192})'|([^\s,;\}\]]{1,8192}))")
 HASH = re.compile(r"(?<![0-9a-fA-F])(?:[0-9a-fA-F]{128}|[0-9a-fA-F]{64}|[0-9a-fA-F]{40}|[0-9a-fA-F]{32})(?![0-9a-fA-F])")
 RANDOM = re.compile(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,256}(?![A-Za-z0-9_+/=-])")
-CARD = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
+CARD = re.compile(r"(?<![A-Za-z0-9])(?:[0-9][ \t\u00a0\u202f-]?){12,18}[0-9](?![A-Za-z0-9])")
 IBAN = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}(?![A-Za-z0-9])")
-PHONE = re.compile(r"(?<!\w)\+[1-9]\d{0,2}(?:[ .()-]?\d){7,14}(?!\d)")
+PHONE = re.compile(r"(?<!\w)\+[1-9]\d{0,2}(?:[ .()\u00a0\u202f-]{0,3}[0-9]){7,14}(?!\d)")
 ODBC = re.compile(r"(?i)\b(?:password|pwd)\s*=\s*([^;\r\n]{1,8192})")
-URI_SECRET_FIELDS = {"password","pwd","token","apikey","api_key","secret","client_secret","access_token","sig","signature","x-amz-signature","x-goog-signature"}
+URI_SECRET_FIELDS = {"password","passwd","pwd","token","apikey","api_key","api-key","secret","api_secret","client_secret","client-secret","access_token","access-token","refresh_token","refresh-token","secret_key","sig","signature","x-amz-signature","x-goog-signature"}
+
+
+# Explicit English constructions, not general semantic classification.
+CREDENTIAL_LABEL = r"(?:password|passwd|pwd|api[ _-]?key|api[ _-]?secret|client[ _-]?secret|access[ _-]?token|refresh[ _-]?token|secret[ _-]?key|private[ _-]?key)"
+CREDENTIAL_VALUE = r"(?:((?:\[redacted\]|<redacted>|\$\{[A-Za-z0-9_]+\}))(?![A-Za-z0-9_])|\"([^\"\r\n]{1,8192})\"|'([^'\r\n]{1,8192})'|([^\s,;\}\]\"']{1,8192}))"
+NATURAL_FORWARD = re.compile(
+    r"(?i)\b" + CREDENTIAL_LABEL +
+    r"(?:[ \t]+(?:to[ \t]+(?:log[ \t]?in|sign[ \t]?in|authenticate)|for[ \t]+(?:login|authentication|the[ \t]+account)))?"
+    r"(?:[ \t]*(?:[:=])[ \t\r\n]*|[ \t]+(?:is|equals)[ \t]+)" + CREDENTIAL_VALUE)
+NATURAL_REVERSE = re.compile(
+    r"(?i)\buse[ \t]+" + CREDENTIAL_VALUE +
+    r"[ \t]+as[ \t]+(?:my|the|your|our|this)[ \t]+" + CREDENTIAL_LABEL + r"\b")
+ASSIGN_V2 = re.compile(r"(?i)\b(" + CREDENTIAL_LABEL + r")\b[\"']?\s*[:=]\s*" + CREDENTIAL_VALUE)
+NATURAL_NONVALUES = {"a", "an", "the", "not", "never", "used", "required", "stored", "hashed", "encrypted", "secret", "private", "confidential", "unknown", "missing", "empty", "optional", "secure", "strong", "weak", "important", "sensitive", "correct", "incorrect", "changed", "forgotten", "needed", "protected", "sharing", "true", "false", "null", "none"}
+
+def explicit_credential(value):
+    for match in ASSIGN_V2.finditer(value):
+        if credential(next(v for v in match.groups()[1:] if v is not None)):
+            return True
+    for pattern in (NATURAL_FORWARD,NATURAL_REVERSE):
+        for match in pattern.finditer(value):
+            candidate=next(v for v in match.groups() if v is not None)
+            if credential(candidate) and candidate.casefold().rstrip(".!?") not in NATURAL_NONVALUES:
+                return True
+    return False
+
+def iban_in_text(value):
+    # Try bounded candidates at whitespace/punctuation boundaries. The former
+    # greedy expression could swallow words after a spaced IBAN.
+    for start in re.finditer(r"(?i)(?<![A-Za-z0-9])[A-Z]{2}[0-9]{2}",value):
+        pos=start.start();compact=""
+        while pos<len(value) and pos-start.start()<128:
+            char=value[pos]
+            if char.isascii() and char.isalnum():
+                compact+=char.upper()
+                if len(compact)>34:break
+                end=pos+1
+                boundary=end==len(value) or not (value[end].isascii() and value[end].isalnum())
+                if len(compact)>=15 and boundary and iban(compact):return True
+            elif char in " \t\r\n\u00a0\u202f":
+                pass
+            else:break
+            pos+=1
+    return False
 
 class InspectionLimit(ValueError):
     pass
@@ -140,6 +184,8 @@ def validate_policy(source):
             if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}",f) for f in r["fields"]):raise ValueError("invalid field name")
             if not isinstance(r["values"],list) or any(not isinstance(v,str) or not v for v in r["values"]):raise ValueError("invalid field values")
             r["_fields"]={re.sub(r"[^a-z]","",f.lower()) for f in r["fields"]}
+            labels="|".join(re.escape(f).replace("_",r"[ _-]?").replace(r"\-",r"[ _-]?") for f in r["fields"])
+            r["_prose_field"]=re.compile(r"(?i)\b(?:"+labels+r")\b[\"']?(?:\s*[:=]\s*|[ \t]+(?:is|equals)[ \t]+)"+CREDENTIAL_VALUE)
         elif kind=="resource":
             if set(r)!=common|{"values","case_sensitive"} or type(r["case_sensitive"]) is not bool:raise ValueError("invalid resource rule")
             strings(r["values"],3)
@@ -157,7 +203,12 @@ def base_views(text,limits):
     while stack:
         location,item,field,depth=stack.pop();nodes+=1
         if nodes>limits["max_views"] or depth>limits["max_json_depth"]:raise InspectionLimit("JSON limit")
-        if isinstance(item,str):result.append((location,item,field))
+        if isinstance(item,str):
+            result.append((location,item,field))
+            if item.lstrip().startswith(("{","[")):
+                try:embedded=json.loads(item)
+                except (ValueError,RecursionError):embedded=None
+                if isinstance(embedded,(dict,list)):stack.append((location+".embedded_json",embedded,field,depth+1))
         elif isinstance(item,dict):
             for i,(key,val) in enumerate(item.items()):
                 loc=location+".object["+str(i)+"]"
@@ -236,7 +287,7 @@ def entropy(value):
 
 def builtin(detector,value,field):
     if detector=="credential_field":return field in FIELDS and credential(value)
-    if detector=="credential_assignment":return any(credential(next(v for v in m.groups()[1:] if v is not None)) for m in ASSIGN.finditer(value))
+    if detector=="credential_assignment":return explicit_credential(value)
     if detector=="private_key_block":return PRIVATE.search(value) is not None
     if detector=="supported_token_format":return TOKENS.search(value) is not None
     if detector=="connection_string":
@@ -249,7 +300,7 @@ def builtin(detector,value,field):
     if detector=="hash_candidate":return HASH.search(value) is not None
     if detector=="entropy_candidate":return any(entropy(m.group())>=4.5 for m in RANDOM.finditer(value))
     if detector=="credit_card":return any(luhn(m.group()) for m in CARD.finditer(value))
-    if detector=="iban":return any(iban(m.group()) for m in IBAN.finditer(value))
+    if detector=="iban":return iban_in_text(value)
     if detector=="phone_candidate":return PHONE.search(value) is not None
     return False
 
@@ -279,6 +330,12 @@ def inspect(policy,text):
                 current=value if rule["case_sensitive"] else value.casefold()
                 allowed=rule["values"] if rule["case_sensitive"] else [v.casefold() for v in rule["values"]]
                 hit=field in rule["_fields"] and credential(value) and (not allowed or current in allowed)
+                if not hit:
+                    for candidate in rule["_prose_field"].finditer(value):
+                        item=next(v for v in candidate.groups() if v is not None)
+                        normalized=item if rule["case_sensitive"] else item.casefold()
+                        if credential(item) and normalized.casefold().rstrip(".!?") not in NATURAL_NONVALUES and (not allowed or normalized in allowed):
+                            hit=True;break
             else:
                 current=value if rule["case_sensitive"] else value.casefold()
                 hit=any((v if rule["case_sensitive"] else v.casefold()) in current for v in rule["values"])

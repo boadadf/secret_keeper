@@ -53,7 +53,7 @@ class PayloadCapture:
                 if p.is_symlink() or (p.exists() and not p.is_file()):raise ValueError("unsafe path")
             self.path=path;self.readable_path=readable_path if enabled else None
             self.limit=limit;self.file_limit=file_limit;self.backups=backups;self.enabled=True
-            LOG.error("Secret Keeper FULL CAPTURE ACTIVE: payload files may contain secrets; readable output=%s",bool(self.readable_path))
+            LOG.warning("Secret Keeper FULL CAPTURE ACTIVE: payload files may contain secrets; readable output=%s",bool(self.readable_path))
         except (OSError,ValueError,TypeError):LOG.error("Secret Keeper CAPTURE ERROR: invalid/unwritable config; capture disabled; enforcement unchanged")
     def rotate(self,path=None):
         path=path or self.path
