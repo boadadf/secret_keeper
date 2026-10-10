@@ -1,0 +1,8 @@
+Before publishing:
+1. Replace [COPYRIGHT HOLDER NAME] in LICENSE with the actual copyright holder's name or organization. The year is set to 2026; adjust it or use a range if appropriate to your ownership history.
+2. This package proposes MIT for an early permissive open-source release. It permits commercial reuse and proprietary derivatives, subject to retaining the required notices. If you want copyleft, choose another license before publishing.
+3. Do not overwrite an existing license without confirming you have the rights to relicense all affected code. Preserve third-party licenses and existing NOTICE content. This package does not invent attribution for dependencies or contributions.
+4. Place LICENSE and DISCLAIMER.md at the repository root; insert README-license-section.md into your preferred README location. It is a section, not a replacement README.
+5. No promise of total legal immunity is made. For deployment or distribution with significant legal exposure, obtain advice from a lawyer qualified in the relevant jurisdiction.
+
+MIT text source: https://choosealicense.com/licenses/mit/

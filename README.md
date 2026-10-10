@@ -12,6 +12,8 @@ Secret Keeper is a local proxy. It checks outgoing content against rules you cho
 - Detects selected password assignments, JSON credential fields, private-key blocks, token shapes, and credential-bearing connection strings.
 - Optionally checks supported encoded text, checksum candidates, phone shapes, hashes, and random-looking strings.
 - Inspects HTTP request bodies and outgoing WebSocket messages.
+- Returns an actionable local HTTP rejection and attempts a local Copilot-formatted answer/completion for supported blocked WebSocket requests.
+- Applies blocking rules to carried history and automatically collected content too; it does not silently redact or exempt previously rejected content.
 - Keeps a metadata-only audit log by default.
 - Optionally creates BOTH a machine-readable capture and a readable text companion.
 
@@ -28,7 +30,7 @@ git clone https://github.com/boadadf/secret_keeper.git
 cd secret_keeper
 ```
 
-This README describes the files after merging Patch 08 with the earlier releases. If a script is missing from your checkout, that patch has not been published/merged there yet.
+This README describes the readable-capture features and the integrated strict-block notification update. If a documented script or helper is missing from your checkout, the corresponding update has not been merged there yet.
 
 ### 2. Prepare the standalone proxy
 
@@ -59,8 +61,10 @@ An empty `rules` list allows inspectable content. Do not mistake it for protecti
 ### 4. Start the proxy — first CMD window
 
 ```bat
-scripts\capture-requests.cmd
+scripts\capture-requests.cmd copilot
 ```
+
+The `copilot` parameter selects the local WebSocket reply format, not a different set of rules. Omitting it also defaults to `copilot`. The launcher still runs one proxy with `request_capture.py` as its only addon entry point; `ws_response_builder.py` is an internal helper, not another addon to launch. Your existing policy remains in use.
 
 Leave it running. It listens on `127.0.0.1:8080` and creates certificate state under `%LOCALAPPDATA%\SecretKeeper` if needed. Its historical filename is retained; capture is OFF unless you enable it.
 
@@ -96,9 +100,20 @@ It should pass. Then test the enabled credential-assignment rule with synthetic 
 password = "Synthetic-Only-42"
 ```
 
-It should produce a block record. A HTTP block returns local status 422. A WebSocket block drops the outgoing message. The client may display an error or retry; improving that UX remains unfinished.
+It should produce a block record. An HTTP block returns local status 422 with an explanation. For a recognized Copilot Responses-style WebSocket request, the proxy drops the outgoing message and attempts to send a local rejection answer ending with `response.completed`. Unknown blocked WebSocket formats, concurrent active responses, and notification failures terminate the flow instead. Client display/retry behavior depends on the client; WebSocket compatibility still needs broader live validation.
 
-Start a fresh conversation after a blocking test. Sensitive content may remain in carried history and legitimately block later harmless prompts.
+The local notice explains:
+
+```text
+SecretKeeper blocked an outbound request that matched your data-protection policy.
+The blocked request was not forwarded. Retry with less context or start a new
+session if the same block repeats. Advanced details are available in the local
+proxy audit log.
+```
+
+No log inspection is required for normal use. A user can retry with less context or start a fresh session. Advanced users can inspect the rule ID and flow reference to understand the decision. The notice does not assume the user deliberately supplied the content: an AI tool can also collect or resend it automatically.
+
+Start a fresh conversation after a blocking test. Sensitive content may remain in carried history and legitimately block later harmless prompts. There is no automatic redaction, history exception, or client-session reset. A later request whose inspected content is clean can proceed; there is no artificial session-wide lockout.
 
 ## Read the data being sent
 
@@ -111,7 +126,7 @@ set "SECRET_KEEPER_CAPTURE_MODE=full"
 scripts\capture-requests.cmd
 ```
 
-Expect `FULL CAPTURE ACTIVE`. The launcher writes:
+Expect `Capture: full` and a warning-level `FULL CAPTURE ACTIVE` notification. The updated capture helper no longer logs successful capture activation as an error, which previously caused a startup exit. The launcher writes:
 
 ```text
 %LOCALAPPDATA%\SecretKeeper\captures\outbound.jsonl
@@ -145,6 +160,19 @@ CONTENT:
 ```
 
 Capture and inspection are independent. Turning capture on does not permit blocked content to forward. `ALLOW` means the proxy permitted forwarding, not proof that the server received the data.
+
+### Console output
+
+The launcher defaults to `flow_detail=1` with informational startup logs. For untruncated built-in flow display, stop the proxy and run:
+
+```bat
+set "SECRET_KEEPER_FLOW_DETAIL=4"
+scripts\capture-requests.cmd copilot
+```
+
+Full console output can expose sensitive headers and payloads. This is mitmdump's built-in display, not the readable capture companion. Streamed HTTP response bodies may not be retained or displayed. Console detail does not change rule decisions or enable file capture.
+
+Restore the default with `set "SECRET_KEEPER_FLOW_DETAIL=1"` before restarting.
 
 ### View older JSONL captures
 
@@ -260,7 +288,7 @@ hash_candidate
 entropy_candidate
 ```
 
-They detect supported patterns, not authentic/active credentials or accounts. Some overlap. Phone detection is shape-only. Hash/entropy candidates do not prove confidentiality; the example uses audit mode for uncertain categories.
+They detect supported patterns, not authentic/active credentials or accounts. The `iban` detector checks supported checksum-valid candidates; labelled incomplete or invalid IBAN-like text is not a separate implemented detector. Set each detector's action deliberately: an audit-only rule does not block by itself. Some overlap. Phone detection is shape-only. Hash/entropy candidates do not prove confidentiality; the example uses audit mode for uncertain categories.
 
 See the example policy and prior patch documentation for each type's fields. Add aliases explicitly; dictionary matching does not infer names.
 
@@ -295,6 +323,7 @@ Default inspected text limit is 2 MiB, distinct from the launcher's 10 MiB trans
 | Audit | State directory + `logs\audit.jsonl` |
 | Capture | State directory + `captures\outbound.jsonl` |
 | Readable capture | Capture path + `.txt` |
+| Console flow detail | `SECRET_KEEPER_FLOW_DETAIL=1`; use `4` explicitly for full display |
 
 Set `SECRET_KEEPER_STATE` or `SECRET_KEEPER_POLICY` before running scripts to override defaults. Set the same custom state in both proxy and Copilot CMD windows. Reuse existing CA state for established clients.
 
@@ -307,11 +336,12 @@ From CMD:
 scripts\test-proxy-integration.cmd
 .venv\Scripts\python.exe tests\integration\run_rule_modes.py
 scripts\test-expanded-rules.cmd
+.venv\Scripts\python.exe -m unittest discover -s tests -p "test_strict_block_notice.py" -v
 ```
 
-Earlier suites have 70 rule tests. This patch's 17 updated capture-helper and 18 formatting/viewer tests passed during generation; run the full installed suite too. The network suites expect 12, 16, and 64 checks respectively and require their earlier helper files.
+Earlier suites have 70 rule tests. The readable-capture update's 17 capture-helper and 18 formatting/viewer tests passed during generation. The strict-block notification update adds 10 passing tests using a stubbed mitmproxy interface. These are separate test groups, not a claim that the full combined checkout has been tested. Run the full installed suite too. The network suites expect 12, 16, and 64 checks respectively and require their earlier helper files.
 
-The maintainer previously verified local rule blocking, the initial 12 network checks, and capture behavior. Patch 08's formatter/viewer tests are executed during generation. Its new CMD scripts, current repository contents, fresh Windows clone, Copilot routing, and combined/network regressions require Windows validation. Do not claim a clean-clone end-to-end test from Linux-only helper tests.
+The maintainer previously verified local rule blocking, the initial 12 network checks, and capture behavior, and reported that the latest strict-block notification update works in local testing. Formatter/viewer and notification tests were executed during generation. This does not establish every transport or client version: record which HTTP and WebSocket cases were actually exercised. Current repository contents, a fresh Windows clone, and the full combined/network regression suite still need release validation. Do not claim a clean-clone end-to-end test from helper tests alone.
 
 The network suites check real local HTTP/WS server receipts with positive controls. Timeout is FAIL, not proof of rejection. They do not establish HTTPS/WSS certificate behavior or all client UX.
 
@@ -327,7 +357,10 @@ The network suites check real local HTTP/WS server receipts with positive contro
 | Harmless prompt blocks | Rule metadata and carried context; try a genuinely fresh session |
 | `policy_error` | Active file exists and schema/settings are valid |
 | `inspection_error` / `inspection_limit` | Inspectability and configured limits, not proof of a secret |
-| No readable file | Full capture enabled, Patch 08 helper present, warning/error messages |
+| No readable file | Full capture enabled, readable-capture helper present, warning/error messages |
+| Startup exits after `FULL CAPTURE ACTIVE` | Update the helper: successful activation must use warning-level logging, not error-level |
+| Only audit lines in console | Console flow detail; set `SECRET_KEEPER_FLOW_DETAIL=4` for full built-in display |
+| Local WebSocket answer missing | Recognized `response.create` format, no active concurrent response, and audit reply/fallback details |
 | Viewer fails at final record | Capture may have been interrupted mid-write; retain original for review |
 
 Do not fix TLS problems by disabling verification. Do not upload raw captures to troubleshoot; share safe audit metadata instead.
@@ -336,7 +369,11 @@ Do not fix TLS problems by disabling verification. Do not upload raw captures to
 
 Not covered: bypassed traffic, incoming WebSocket messages, actual request headers or URL/query fields, arbitrary binary/files/images, every token/encoding, cross-message secrets, indirect identities, complete admin/resource hardening, or all unexpected addon failures.
 
-URL rules inspect URL text inside bodies; they are not destination allowlists. HTTP rejects use 422; WebSocket rejects drop the message. Client retries remain unfinished. No automatic redaction or LLM stage currently exists.
+URL rules inspect URL text inside bodies; they are not destination allowlists. HTTP rejects use 422 with a local explanation, rule ID, and flow reference. Supported Copilot WebSocket rejects drop the outbound request and attempt a synthetic local answer/completion; this is not a response from the remote model. Generated local response IDs do not exist upstream, and attempts to continue from them are locally rejected. Unknown formats, active concurrent responses, and notification failures terminate the connection. A queued notification does not prove the client displayed it or returned to idle.
+
+The WebSocket adapter currently recognizes JSON `response.create` requests and uses a minimal Responses-style lifecycle with local identifiers. Copilot acceptance across versions, proprietary headers, and all retry paths is not established. This is pre-forward rule blocking, not a token-budget counter or cancellation of an already-running upstream model call.
+
+No automatic redaction, history sanitization, session restart, or LLM stage currently exists. Retried history, session-title requests, and event uploads are not exempt from blocking. Retry with less context or start a fresh session if protected content remains. The proxy cannot undo disclosures from earlier allowed traffic.
 
 Keep real policies, certificate state/private keys, captures, logs, `.venv`, and private environment files out of Git. Public example is `config/secret-keeper-policy.example.json`; local `config/secret-keeper-policy.json` should be ignored. Ignore rules do not erase history.
 
@@ -344,4 +381,4 @@ Contribute safe synthetic fixtures, documented detector limits, allow/block case
 
 ## Next steps
 
-Optional local semantic validation, clearer client rejection, broader testing, and deployment/data-retention hardening. These are planned, not current protection guarantees.
+Optional local semantic validation, broader HTTP/WebSocket compatibility testing, labelled incomplete-IBAN candidate detection, and deployment/data-retention hardening. Local block notices are implemented; automatic client-session restart and complete client recovery are not. Planned work is not a current protection guarantee.
