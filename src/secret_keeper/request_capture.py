@@ -40,6 +40,7 @@ class RequestCapture:
                 self.policy=validate_policy(json.loads(path.read_text(encoding="utf-8")))
                 self.policy_error=False
                 LOG.info("Secret Keeper loaded schema %s, %s rules",self.policy["source_schema_version"],len(self.policy["rules"]))
+                LOG.info("Secret Keeper loaded %s replacement rules",len(self.policy.get("replacements",[])))
             except (OSError,ValueError,TypeError,RecursionError):
                 self.policy=None;self.policy_error=True
                 LOG.error("Secret Keeper POLICY ERROR: fix private policy and restart; requests will reject")
@@ -52,6 +53,7 @@ class RequestCapture:
         record={"schema_version":6,"timestamp":datetime.now(timezone.utc).isoformat(),"flow_id":flow.id,"transport":transport,"direction":"client_to_server","decision":decision}
         record.update(details or {})
         if decision in ("BLOCK","AUDIT"):LOG.error("Secret Keeper %s %s",decision,json.dumps(record,ensure_ascii=True))
+        if decision=="REPLACE":LOG.info("Secret Keeper REPLACE %s",json.dumps(record,ensure_ascii=True))
         if not ctx.options.request_log:return
         try:
             path=Path(ctx.options.request_log).expanduser();path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -63,22 +65,47 @@ class RequestCapture:
         for match in matches:self.audit(flow,transport,"BLOCK" if match["action"]=="block" else "AUDIT",dict(match,final_decision="BLOCK" if blocked else "ALLOW"))
         if not blocked:self.audit(flow,transport,"ALLOW")
     def failure(self,rule):return [{"rule_id":rule,"action":"block","location":"body"}]
+    def prepare(self,text):
+        if self.policy_error or self.policy is None:return text,[],self.evaluate(text)
+        candidate,replacements=_rules.replace_text(self.policy,text)
+        return candidate,replacements,self.evaluate(candidate)
+    def record_replacements(self,flow,transport,replacements,matches):
+        decision="BLOCK" if any(m["action"]=="block" for m in matches) else "ALLOW"
+        for replacement in replacements:
+            self.audit(flow,transport,"REPLACE",dict(replacement,final_decision=decision))
+    def capture_pair(self,flow,transport,matches,raw,text,candidate,replacements,message_index=None):
+        self.capture.write(flow,transport,matches,raw,text,message_index)
+        if replacements and candidate is not None:
+            stage="replacement_candidate" if any(m["action"]=="block" for m in matches) else "transformed_outbound"
+            self.capture.write(flow,transport,matches,candidate.encode("utf-8"),candidate,message_index,capture_stage=stage,replacements=replacements)
     def request(self,flow:http.HTTPFlow):
-        raw=None;text=None
+        raw=None;text=None;candidate=None;replacements=[]
         try:
             raw=flow.request.raw_content
             if raw is None:matches=self.failure("body_unavailable")
             else:
                 text=flow.request.get_text(strict=True) or ""
-                matches=self.evaluate(text)
+                candidate,replacements,matches=self.prepare(text)
         except _rules.InspectionLimit:matches=self.failure("inspection_limit")
         except (ValueError,RecursionError):matches=self.failure("inspection_error")
+        if replacements and not any(m["action"]=="block" for m in matches):
+            try:
+                headers=getattr(flow.request,"headers",{})
+                media=headers.get("content-type","").split(";",1)[0].strip().lower()
+                if media and not (media=="application/json" or media.endswith("+json") or media.startswith("text/")):
+                    raise ValueError("unsupported replacement body format")
+                if any(headers.get(h) for h in ("content-md5","digest","content-digest","signature","signature-input")):
+                    raise ValueError("signed/digested body replacement unsupported")
+                flow.request.text=candidate
+                if flow.request.get_text(strict=True)!=candidate:raise ValueError("replacement assignment mismatch")
+            except (ValueError,TypeError,UnicodeError,AttributeError):matches=self.failure("replacement_error")
         block=next((m for m in matches if m["action"]=="block"),None)
         if block:
             flow.response=http.Response.make(422,json.dumps({"error":{"type":"policy_violation","code":"secret_keeper_blocked","message":_reply.NOTICE,"rule_id":block["rule_id"],"reference":flow.id}}).encode(),{"Content-Type":"application/json","Cache-Control":"no-store","X-SecretKeeper-Blocked":"true"})
             LOG.warning("SecretKeeper prevented an outbound disclosure. Retry with less context or start a new session. Details: rule=%s reference=%s",block["rule_id"],flow.id)
+        self.record_replacements(flow,"http",replacements,matches)
         self.record_matches(flow,"http",matches)
-        self.capture.write(flow,"http",matches,raw,text)
+        self.capture_pair(flow,"http",matches,raw,text,candidate,replacements)
     def websocket_end(self, flow):
         self.ws_active.pop(flow.id, None)
         self.ws_local_ids.pop(flow.id, None)
@@ -89,7 +116,7 @@ class RequestCapture:
         if not flow.websocket or not flow.websocket.messages:return
         message=flow.websocket.messages[-1]
         if getattr(message,"injected",False):return
-        text=None;payload=None
+        text=None;payload=None;candidate=None;replacements=[];original_raw=message.content
         try:
             text=message.content.decode("utf-8",errors="strict")
             parsed=json.loads(text)
@@ -99,16 +126,24 @@ class RequestCapture:
             if payload and payload.get("type") in ("response.completed","response.failed","response.incomplete"):
                 self.ws_active[flow.id]=max(0,self.ws_active.get(flow.id,0)-1)
             return
-        try:matches=self.evaluate(text) if text is not None else self.failure("inspection_error")
+        try:
+            if text is None:matches=self.failure("inspection_error")
+            else:candidate,replacements,matches=self.prepare(text)
         except _rules.InspectionLimit:matches=self.failure("inspection_limit")
         except (ValueError,RecursionError):matches=self.failure("inspection_error")
         previous=payload.get("previous_response_id") if payload else None
         if isinstance(previous,str) and previous in self.ws_local_ids.get(flow.id,set()):
             matches.append({"rule_id":"local_response_continuation","action":"block","location":"adapter"})
+        if replacements and not any(m["action"]=="block" for m in matches):
+            try:
+                message.content=candidate.encode("utf-8")
+                if message.content!=candidate.encode("utf-8"):raise ValueError("WS replacement assignment mismatch")
+            except (ValueError,TypeError,UnicodeError,AttributeError):matches=self.failure("replacement_error")
         blocked=any(m["action"]=="block" for m in matches)
         if blocked:message.drop()
+        self.record_replacements(flow,"websocket",replacements,matches)
         self.record_matches(flow,"websocket",matches)
-        self.capture.write(flow,"websocket",matches,message.content,text,len(flow.websocket.messages)-1)
+        self.capture_pair(flow,"websocket",matches,original_raw,text,candidate,replacements,len(flow.websocket.messages)-1)
         if not blocked:
             if payload and payload.get("type")=="response.create":self.ws_active[flow.id]=self.ws_active.get(flow.id,0)+1
             return

@@ -127,7 +127,7 @@ def addon(monkeypatch,tmp_path):
     spec=importlib.util.spec_from_file_location("proxy_under_test",ROOT/"src/secret_keeper/request_capture.py")
     mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
     obj=mod.RequestCapture();obj.policy=mod.validate_policy({"schema_version":2,"rules":[r("exact_text",value="SYNTHETIC")]});obj.policy_error=False
-    flow=SimpleNamespace(id="test",response=None,request=SimpleNamespace(raw_content=b"hello",get_text=lambda strict:"hello",stream=True),websocket=SimpleNamespace(messages=[]))
+    flow=SimpleNamespace(id="test",kill=lambda:None,response=None,request=SimpleNamespace(raw_content=b"hello",get_text=lambda strict:"hello",stream=True),websocket=SimpleNamespace(messages=[]))
     return obj,flow,context,tmp_path,mod
 
 @pytest.mark.parametrize("mode",["block","audit","disabled","conflict"])

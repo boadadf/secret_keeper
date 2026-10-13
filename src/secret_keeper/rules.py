@@ -127,7 +127,7 @@ def validate_policy(source):
             old_ids.add(entry["id"])
             rules.append({"id":"dictionary-"+str(i),"type":"dictionary","enabled":True,"action":"block","matching":dict(MATCHING,boundary=entry["boundary"]),"entries":[{"id":entry["id"],"values":entry["values"]}]})
         source={"schema_version":2,"rules":rules}
-    if source["schema_version"]!=2 or set(source)-{"schema_version","rules","inspection"} or not isinstance(source.get("rules"),list):
+    if source["schema_version"]!=2 or set(source)-{"schema_version","rules","inspection","replacements"} or not isinstance(source.get("rules"),list):
         raise ValueError("invalid schema-2 policy")
     limits=dict(LIMITS)
     extra=source.get("inspection",{})
@@ -192,7 +192,7 @@ def validate_policy(source):
         else:raise ValueError("unsupported rule type")
         if legacy and kind=="dictionary":r["_legacy"]=True
         compiled.append(r)
-    return {"schema_version":2,"source_schema_version":1 if legacy else 2,"rules":compiled,"inspection":limits}
+    return {"schema_version":2,"source_schema_version":1 if legacy else 2,"rules":compiled,"inspection":limits,"replacements":compile_replacements(source.get("replacements",[]),ids)}
 
 
 def base_views(text,limits):
@@ -345,3 +345,87 @@ def inspect(policy,text):
                 if entry_id:match["entry_id"]=entry_id
                 matches.append(match);break
     return matches
+
+
+DEFAULT_REPLACEMENT_FIELDS = ("prompt", "content", "text", "title", "transformedContent", "instructions", "system", "description")
+
+def compile_replacements(items, rule_ids=()):
+    if not isinstance(items,list) or len(items)>128:raise ValueError("invalid replacements list")
+    compiled=[];seen=set(rule_ids)
+    allowed={"id","enabled","find","replace_with","case_sensitive","boundary","fields"}
+    required=allowed-{"fields"}
+    for item in items:
+        if not isinstance(item,dict) or set(item)-allowed or not required<=set(item):raise ValueError("invalid replacement fields")
+        if not ident(item["id"]) or item["id"] in seen:raise ValueError("invalid/duplicate replacement ID")
+        seen.add(item["id"])
+        if type(item["enabled"]) is not bool or type(item["case_sensitive"]) is not bool:raise ValueError("replacement flags must be boolean")
+        if not isinstance(item["find"],str) or not 1<=len(item["find"])<=8192:raise ValueError("invalid replacement find")
+        if not isinstance(item["replace_with"],str) or len(item["replace_with"])>8192:raise ValueError("invalid replacement value")
+        if item["boundary"] not in ("whole_phrase","substring"):raise ValueError("invalid replacement boundary")
+        fields=item.get("fields",list(DEFAULT_REPLACEMENT_FIELDS))
+        if not isinstance(fields,list) or not fields or len(fields)>64 or any(not isinstance(f,str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}",f) for f in fields):raise ValueError("invalid replacement fields scope")
+        expression=re.escape(item["find"])
+        if item["boundary"]=="whole_phrase":expression=r"(?<!\w)"+expression+r"(?!\w)"
+        compiled.append(dict(item,_pattern=re.compile(expression,0 if item["case_sensitive"] else re.IGNORECASE),_fields=set(fields)))
+    return compiled
+
+def replace_text(policy,text):
+    """Bounded literal replacements; JSON keys and unselected fields are unchanged."""
+    enabled=[r for r in policy.get("replacements",[]) if r["enabled"]]
+    if not enabled:return text,[]
+    limits=policy["inspection"];max_bytes=limits["max_input_bytes"]
+    if len(text.encode("utf-8"))>max_bytes:raise InspectionLimit("replacement input limit")
+    counts={r["id"]:0 for r in enabled};nodes=0;occurrences=0;extra_bytes=0
+    def literal(value,field,plain=False):
+        nonlocal occurrences,extra_bytes
+        candidates=[]
+        for order,r in enumerate(enabled):
+            if not plain and field not in r["_fields"]:continue
+            for m in r["_pattern"].finditer(value):
+                candidates.append((m.start(),-len(m.group()),order,m.end(),r))
+                if len(candidates)>limits["max_views"]:raise InspectionLimit("replacement match limit")
+        candidates.sort(key=lambda x:x[:3]);parts=[];end=0
+        for start,_,_,stop,r in candidates:
+            if start<end:continue
+            occurrences+=1
+            if occurrences>limits["max_views"]:raise InspectionLimit("replacement occurrence limit")
+            replacement=r["replace_with"]
+            extra_bytes+=max(0,len(replacement.encode("utf-8"))-len(value[start:stop].encode("utf-8")))
+            if extra_bytes>max_bytes:raise InspectionLimit("replacement expansion limit")
+            parts.extend((value[end:start],replacement));end=stop;counts[r["id"]]+=1
+        if not parts:return value
+        parts.append(value[end:]);return "".join(parts)
+    def pairs(items):
+        result={}
+        for key,value in items:
+            if key in result:raise ValueError("duplicate JSON keys not supported for replacement")
+            result[key]=value
+        return result
+    def reject_constant(value):raise ValueError("nonfinite JSON value")
+    def parse(value):return json.loads(value,object_pairs_hook=pairs,parse_constant=reject_constant)
+    def visit(value,field=None,depth=0):
+        nonlocal nodes
+        nodes+=1
+        if nodes>limits["max_views"] or depth>limits["max_json_depth"]:raise InspectionLimit("replacement structure limit")
+        if isinstance(value,dict):return {k:visit(v,k,depth+1) for k,v in value.items()}
+        if isinstance(value,list):return [visit(v,field,depth+1) for v in value]
+        if isinstance(value,str):
+            selected=any(field in r["_fields"] for r in enabled)
+            if selected and value.lstrip().startswith(("{","[")):
+                try:nested=parse(value)
+                except json.JSONDecodeError:nested=None
+                if isinstance(nested,(dict,list)):
+                    before=sum(counts.values());changed=visit(nested,None,depth+1)
+                    if sum(counts.values())!=before:return json.dumps(changed,ensure_ascii=False,separators=(",",":"),allow_nan=False)
+                    return value
+            return literal(value,field)
+        return value
+    try:body=parse(text)
+    except json.JSONDecodeError:
+        if text.lstrip().startswith(("{","[")):raise ValueError("malformed JSON replacement input")
+        result=literal(text,None,plain=True)
+    else:
+        body=visit(body)
+        result=json.dumps(body,ensure_ascii=False,separators=(",",":"),allow_nan=False) if any(counts.values()) else text
+    if len(result.encode("utf-8"))>max_bytes:raise InspectionLimit("replacement output limit")
+    return result,[{"rule_id":r["id"],"action":"replace","occurrences":counts[r["id"]]} for r in enabled if counts[r["id"]]]

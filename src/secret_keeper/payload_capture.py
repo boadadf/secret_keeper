@@ -70,13 +70,15 @@ class PayloadCapture:
             fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
             with os.fdopen(fd,"ab") as out:out.write(data)
         except (OSError,ValueError):LOG.error("Secret Keeper CAPTURE WRITE FAILED (%s): record not guaranteed saved; enforcement unchanged",label)
-    def write(self,flow,transport,matches,raw=None,text=None,message_index=None):
+    def write(self,flow,transport,matches,raw=None,text=None,message_index=None,*,capture_stage="attempted_outbound",replacements=None):
         if not self.enabled:return
         record={"schema_version":1,"timestamp":datetime.now(timezone.utc).isoformat(),"flow_id":flow.id,"transport":transport,
-                "direction":"client_to_server","capture_stage":"attempted_outbound",
+                "direction":"client_to_server","capture_stage":capture_stage,
                 "final_decision":"BLOCK" if any(m.get("action")=="block" for m in matches) else "ALLOW",
                 "matched_rule_ids":[m["rule_id"] for m in matches],"body_available":raw is not None,
                 "raw_body_bytes":len(raw) if raw is not None else None,"payload_limit_bytes":self.limit}
+        if replacements:record["replacements"]=[{"rule_id":r["rule_id"],"occurrences":r["occurrences"]} for r in replacements]
+        if capture_stage!="attempted_outbound":record["raw_representation"]="utf8_candidate_not_wire_encoding"
         if message_index is not None:record["message_index"]=message_index
         if raw is not None:
             record["body_raw_base64"]=base64.b64encode(raw[:self.limit]).decode("ascii");record["raw_truncated"]=len(raw)>self.limit
